@@ -419,3 +419,17 @@ func TestRun_Concurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestSkill_FileContent(t *testing.T) {
+	skillPath := filepath.Join("..", "skills", "wackyproc", "SKILL.md")
+	content, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("failed to read skill file %s: %v", skillPath, err)
+	}
+	if !strings.Contains(string(content), "name: wackyproc") {
+		t.Errorf("expected skill to contain 'name: wackyproc'")
+	}
+	if !strings.Contains(string(content), "# WackyProc Process Management & Long-Running Command Guide") {
+		t.Errorf("expected skill to contain guide title")
+	}
+}

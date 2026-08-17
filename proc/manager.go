@@ -180,12 +180,26 @@ func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writ
 	return nil
 }
 
+// clampWaitSeconds bounds a requested wait duration to [1, MaxWaitSeconds].
+// Letting a caller block indefinitely (or for an unreasonably long single
+// call) defeats the point of a process manager meant to avoid tying up a
+// turn on long-running work; clamping preserves Wait's existing "nothing
+// finished in time" contract (empty string, not an error) rather than
+// adding a new failure mode for a too-large request.
+func clampWaitSeconds(requested int) int {
+	if requested <= 0 {
+		return 1
+	}
+	if requested > MaxWaitSeconds {
+		return MaxWaitSeconds
+	}
+	return requested
+}
+
 // Wait blocks up to timeoutSeconds for any tracked background process to complete.
 // Returns the proc_id of whichever completes first, or empty string if timeout expires.
 func Wait(cwd string, timeoutSeconds int) (string, error) {
-	if timeoutSeconds <= 0 {
-		timeoutSeconds = 1
-	}
+	timeoutSeconds = clampWaitSeconds(timeoutSeconds)
 
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
 	ticker := time.NewTicker(time.Duration(DefaultWaitPollIntervalMs) * time.Millisecond)

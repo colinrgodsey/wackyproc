@@ -20,6 +20,7 @@ const (
 	StopGracePeriodMs         = 3000
 	IDLength                  = 4
 	MaxIDGenerationRetries    = 100
+	MaxWaitSeconds            = 500
 )
 
 // Meta records metadata about a spawned background process.

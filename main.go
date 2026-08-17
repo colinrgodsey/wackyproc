@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,9 @@ import (
 	"github.com/colinrgodsey/wackyproc/proc"
 	"github.com/spf13/cobra"
 )
+
+//go:embed skills/wackyproc/SKILL.md
+var bundledWackyprocSkill string
 
 var (
 	jsonOutput  bool
@@ -185,6 +189,15 @@ var superviseCmd = &cobra.Command{
 	},
 }
 
+var skillCmd = &cobra.Command{
+	Use:   "skill",
+	Short: "Print the wackyproc agent skill guide",
+	Long:  "Prints the complete agent skill guide for wackyproc, including background proxy patterns and process management workflows.",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Print(bundledWackyprocSkill)
+	},
+}
+
 func init() {
 	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output process list as JSON")
 	stopCmd.Flags().IntVar(&stopTimeout, "timeout", 3, "Seconds to wait after SIGTERM before sending SIGKILL")
@@ -194,6 +207,7 @@ func init() {
 	rootCmd.AddCommand(waitCmd)
 	rootCmd.AddCommand(getCmd)
 	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(skillCmd)
 	rootCmd.AddCommand(superviseCmd)
 }
 
