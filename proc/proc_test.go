@@ -433,3 +433,157 @@ func TestSkill_FileContent(t *testing.T) {
 		t.Errorf("expected skill to contain guide title")
 	}
 }
+
+func TestRun_RecursiveToolResolution(t *testing.T) {
+	cwd := setupTestEnv(t)
+	toolsDir := filepath.Join(cwd, proc.ToolsDirName)
+
+	// 1. Nested subdirectory tool: tools/nested/sub/subtool
+	subDir := filepath.Join(toolsDir, "nested", "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	subToolPath := filepath.Join(subDir, "subtool")
+	if err := os.WriteFile(subToolPath, []byte("#!/bin/sh\necho 'from subtool'\n"), 0755); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// 2. External directory symlinked into tools/: tools/pack -> <externalDir>
+	extDir := t.TempDir()
+	extToolPath := filepath.Join(extDir, "packtool")
+	if err := os.WriteFile(extToolPath, []byte("#!/bin/sh\necho 'from packtool'\n"), 0755); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	packSymlink := filepath.Join(toolsDir, "pack")
+	if err := os.Symlink(extDir, packSymlink); err != nil {
+		t.Fatalf("Symlink dir failed: %v", err)
+	}
+
+	// 3. File symlink directly in tools/: tools/symfile -> <extDir>/filetool
+	extFileToolPath := filepath.Join(extDir, "filetool")
+	if err := os.WriteFile(extFileToolPath, []byte("#!/bin/sh\necho 'from filetool'\n"), 0755); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	fileSymlink := filepath.Join(toolsDir, "symfile")
+	if err := os.Symlink(extFileToolPath, fileSymlink); err != nil {
+		t.Fatalf("Symlink file failed: %v", err)
+	}
+
+	// 4. Non-executable file in tools/ -> should fail
+	nonExec := filepath.Join(toolsDir, "README.txt")
+	_ = os.WriteFile(nonExec, []byte("plain text"), 0644)
+
+	// Test case A: discover nested tool by base name
+	id1, err := proc.Run(cwd, "subtool", nil, nil)
+	if err != nil {
+		t.Fatalf("failed to run nested subtool: %v", err)
+	}
+	if len(id1) != proc.IDLength {
+		t.Errorf("expected ID length %d, got %s", proc.IDLength, id1)
+	}
+
+	// Test case B: direct relative path nested tool
+	id2, err := proc.Run(cwd, "nested/sub/subtool", nil, nil)
+	if err != nil {
+		t.Fatalf("failed to run direct relative subtool: %v", err)
+	}
+	if len(id2) != proc.IDLength {
+		t.Errorf("expected ID length %d, got %s", proc.IDLength, id2)
+	}
+
+	// Test case C: discover tool inside directory symlink by base name
+	id3, err := proc.Run(cwd, "packtool", nil, nil)
+	if err != nil {
+		t.Fatalf("failed to run packtool from directory symlink: %v", err)
+	}
+	if len(id3) != proc.IDLength {
+		t.Errorf("expected ID length %d, got %s", proc.IDLength, id3)
+	}
+
+	// Test case D: file symlink
+	id4, err := proc.Run(cwd, "symfile", nil, nil)
+	if err != nil {
+		t.Fatalf("failed to run symfile: %v", err)
+	}
+	if len(id4) != proc.IDLength {
+		t.Errorf("expected ID length %d, got %s", proc.IDLength, id4)
+	}
+
+	// Test case E: non-executable file -> should fail
+	if _, err := proc.Run(cwd, "README.txt", nil, nil); err == nil {
+		t.Fatalf("expected non-executable file to fail")
+	}
+
+	// Test case F: path traversal -> should fail
+	if _, err := proc.Run(cwd, "../../bin/sh", nil, nil); err == nil {
+		t.Fatalf("expected path traversal attempt to fail")
+	}
+
+	// Clean up background supervisors
+	time.Sleep(100 * time.Millisecond)
+}
+
+func TestResolveToolPath_CollisionMatchesWackypubD14(t *testing.T) {
+	cwd := setupTestEnv(t)
+	toolsDir := filepath.Join(cwd, proc.ToolsDirName)
+
+	// tools/foo (top-level) and tools/sub/foo (nested) share the same base name.
+	topPath := createExecutable(t, cwd, "foo", "echo 'top-level foo'")
+
+	subDir := filepath.Join(toolsDir, "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	nestedPath := filepath.Join(subDir, "foo")
+	if err := os.WriteFile(nestedPath, []byte("#!/bin/sh\necho 'nested foo'\n"), 0755); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	resolved, err := proc.ResolveToolPath(cwd, "foo")
+	if err != nil {
+		t.Fatalf("ResolveToolPath failed: %v", err)
+	}
+
+	// Must match wackypub's own DiscoverAgentToolsMap (D14): last-write-wins
+	// during the walk, so the nested tool overrides the top-level one - not
+	// the top-level file that happens to be a direct match.
+	if resolved != nestedPath {
+		t.Errorf("expected collision to resolve to nested tool %q (matching wackypub's D14 discovery), got %q (top-level was %q)", nestedPath, resolved, topPath)
+	}
+}
+
+func TestRun_VariableArgsAndFlags(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "arg-echo", `
+for a in "$@"; do
+  echo "ARG: $a"
+done
+`)
+
+	args := []string{"-c", "sleep 1", "--port", "8080", "--verbose", "extra arg with spaces"}
+	id, err := proc.Run(cwd, "arg-echo", args, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	completedID, err := proc.Wait(cwd, 5)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if completedID != id {
+		t.Fatalf("expected completed ID %q, got %q", id, completedID)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if err := proc.Get(cwd, id, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Get failed: %v", err)
+	}
+
+	output := stdoutBuf.String()
+	for _, expectedArg := range args {
+		if !strings.Contains(output, "ARG: "+expectedArg) {
+			t.Errorf("expected arg %q to be passed to tool, got output:\n%s", expectedArg, output)
+		}
+	}
+}

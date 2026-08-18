@@ -8,29 +8,114 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 )
 
+// ResolveToolPath searches <cwd>/tools/ recursively for an executable matching toolName (matching D14 tool discovery).
+// Resolves directory and file symlinks and follows them, preventing infinite symlink cycles.
+// Rejects tool names attempting directory traversal outside tools/.
+// Returns the resolved path to the executable or an error if not found in tools/.
+func ResolveToolPath(cwd string, toolName string) (string, error) {
+	if toolName == "" {
+		return "", fmt.Errorf("tool name is required")
+	}
+
+	toolsDir := filepath.Join(cwd, ToolsDirName)
+	if _, err := os.Stat(toolsDir); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("tool %q not found in %s/ (no PATH fallback)", toolName, ToolsDirName)
+		}
+		return "", fmt.Errorf("failed to access %s directory: %w", ToolsDirName, err)
+	}
+
+	// 1. Direct relative-path lookup in tools/ (e.g. tools/sub/mytool if
+	// toolName is "sub/mytool") - only for names that actually specify a
+	// subpath. A bare name (no separator) always falls through to the
+	// recursive walk below instead, so a same-named tool nested elsewhere
+	// in the tree can shadow it, matching wackypub's own D14 discovery
+	// (DiscoverAgentToolsMap) instead of silently preferring whatever
+	// happens to sit directly under tools/.
+	// Guard against path traversal outside tools/
+	if strings.ContainsRune(toolName, '/') {
+		cleanDirect := filepath.Clean(filepath.Join(toolsDir, toolName))
+		cleanToolsDir := filepath.Clean(toolsDir)
+		if strings.HasPrefix(cleanDirect, cleanToolsDir+string(filepath.Separator)) || cleanDirect == cleanToolsDir {
+			if info, err := os.Stat(cleanDirect); err == nil && info.Mode().IsRegular() && info.Mode()&0111 != 0 {
+				return cleanDirect, nil
+			}
+		}
+	}
+
+	// 2. Recursive discovery under <cwd>/tools/ following directory symlinks with cycle detection (D14)
+	toolMap := make(map[string]string)
+	visitedDirs := make(map[string]bool)
+
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		realDir, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			return nil // Skip unresolvable directory symlinks
+		}
+		if visitedDirs[realDir] {
+			return nil // Prevent cycle
+		}
+		visitedDirs[realDir] = true
+
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			info, err := os.Stat(path) // os.Stat follows symlinks
+			if err != nil {
+				continue // Skip broken symlinks or unreadable files
+			}
+
+			if info.IsDir() {
+				if err := walk(path); err != nil {
+					return err
+				}
+			} else if info.Mode().IsRegular() && info.Mode()&0111 != 0 {
+				name := entry.Name()
+				// Last-write-wins on collision, matching wackypub's own
+				// DiscoverAgentToolsMap (D14) - a later-discovered tool
+				// (e.g. a nested one) overrides an earlier same-named one,
+				// so wackyproc resolves any given tool name identically to
+				// run_command (D58).
+				toolMap[name] = path
+			}
+		}
+		return nil
+	}
+
+	if err := walk(toolsDir); err != nil {
+		return "", fmt.Errorf("failed walking %s directory: %w", ToolsDirName, err)
+	}
+
+	if resolved, ok := toolMap[toolName]; ok {
+		return resolved, nil
+	}
+
+	return "", fmt.Errorf("tool %q not found in %s/ (no PATH fallback)", toolName, ToolsDirName)
+}
+
 // Run spawns a background process detached from the current session.
-// Strictly resolves toolName against <cwd>/tools/<toolName> (no $PATH fallback).
+// Resolves toolName recursively against <cwd>/tools/ following directory symlinks and nested folders
+// with cycle detection (no $PATH fallback).
 // Synchronously drains stdinReader to .proc/<id>/stdin before detaching the supervisor.
 func Run(cwd string, toolName string, args []string, stdinReader io.Reader) (string, error) {
 	if toolName == "" {
 		return "", fmt.Errorf("tool name is required")
 	}
 
-	// 1. Strict tool resolution against <cwd>/tools/<toolName> - NO $PATH fallback
-	toolPath := filepath.Join(cwd, ToolsDirName, toolName)
-	fileInfo, err := os.Stat(toolPath)
+	// 1. Strict tool resolution against <cwd>/tools/ recursively - NO $PATH fallback
+	toolPath, err := ResolveToolPath(cwd, toolName)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("tool %q not found in %s/ (no PATH fallback)", toolName, ToolsDirName)
-		}
-		return "", fmt.Errorf("failed to access tool %s: %w", toolPath, err)
-	}
-	if fileInfo.IsDir() {
-		return "", fmt.Errorf("tool path %s is a directory, not an executable", toolPath)
+		return "", err
 	}
 
 	procBaseDir := filepath.Join(cwd, ProcDirName)

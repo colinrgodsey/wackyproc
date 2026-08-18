@@ -40,8 +40,12 @@ Returns the allocated 4-character process ID immediately. The process runs
 detached in its own process group and session, surviving the agent turn.
 Any stdin passed to wackyproc is drained synchronously into .proc/<id>/stdin
 before detaching.`,
-	Args: cobra.MinimumNArgs(1),
+	DisableFlagParsing: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 || (len(args) == 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "help")) {
+			return cmd.Help()
+		}
+
 		cwd, err := os.Getwd()
 		if err != nil {
 			return fmt.Errorf("failed to get current working directory: %w", err)
