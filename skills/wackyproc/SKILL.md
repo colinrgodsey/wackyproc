@@ -1,6 +1,7 @@
 ---
 name: wackyproc
 description: Guide for running and managing background processes across turns using wackyproc.
+always_load: true
 ---
 # WackyProc Process Management & Long-Running Command Guide
 
