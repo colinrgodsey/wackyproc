@@ -281,10 +281,52 @@ func clampWaitSeconds(requested int) int {
 	return requested
 }
 
-// Wait blocks up to timeoutSeconds for any tracked background process to complete.
-// Returns the proc_id of whichever completes first, or empty string if timeout expires.
-func Wait(cwd string, timeoutSeconds int) (string, error) {
+func isTerminal(status string) bool {
+	return status == StatusCompleted || status == StatusFailed || status == StatusCrashed
+}
+
+// Wait blocks up to timeoutSeconds for a background process to reach a terminal state.
+// If targetID is provided, Wait blocks until that specific process reaches a terminal state;
+// baseline exclusion does not apply to a targeted wait.
+// If targetID is omitted, Wait blocks until any process that was still running when the call began
+// reaches a terminal state, ignoring processes already terminal when the call started.
+// Returns the process ID of the completed process, or an empty string if the timeout expires.
+func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
+	var target string
+	hasTarget := len(targetID) > 0
+	if hasTarget {
+		target = targetID[0]
+	}
+
 	timeoutSeconds = clampWaitSeconds(timeoutSeconds)
+
+	if hasTarget {
+		// An empty target has to be rejected here rather than falling through:
+		// filepath.Join drops the empty component, so the Stat below would resolve
+		// cwd/.proc, which exists once any process has run, and a bare --for would
+		// block until timeout instead of failing fast.
+		if target == "" {
+			return "", fmt.Errorf("process %q not found", target)
+		}
+		procDir := filepath.Join(cwd, ProcDirName, target)
+		if _, err := os.Stat(procDir); os.IsNotExist(err) {
+			return "", fmt.Errorf("process %q not found", target)
+		}
+	}
+
+	var baselineTerminal map[string]bool
+	if !hasTarget {
+		baselineTerminal = make(map[string]bool)
+		initList, err := List(cwd)
+		if err != nil {
+			return "", err
+		}
+		for _, p := range initList {
+			if isTerminal(p.Status) {
+				baselineTerminal[p.ID] = true
+			}
+		}
+	}
 
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
 	ticker := time.NewTicker(time.Duration(DefaultWaitPollIntervalMs) * time.Millisecond)
@@ -296,13 +338,30 @@ func Wait(cwd string, timeoutSeconds int) (string, error) {
 			return "", err
 		}
 
-		if len(list) == 0 {
-			return "", fmt.Errorf("no tracked processes found")
-		}
-
-		for _, p := range list {
-			if p.Status == StatusCompleted || p.Status == StatusFailed || p.Status == StatusCrashed {
-				return p.ID, nil
+		if hasTarget {
+			var found *ProcessInfo
+			for i := range list {
+				if list[i].ID == target {
+					found = &list[i]
+					break
+				}
+			}
+			if found == nil {
+				procDir := filepath.Join(cwd, ProcDirName, target)
+				if _, err := os.Stat(procDir); os.IsNotExist(err) {
+					return "", fmt.Errorf("process %q not found", target)
+				}
+			} else if isTerminal(found.Status) {
+				return found.ID, nil
+			}
+		} else {
+			for _, p := range list {
+				if isTerminal(p.Status) {
+					if baselineTerminal[p.ID] {
+						continue
+					}
+					return p.ID, nil
+				}
 			}
 		}
 

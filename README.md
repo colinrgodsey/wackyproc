@@ -16,7 +16,8 @@ In turn-based agent runtimes (like [wackypub](https://github.com/colinrgodsey/wa
 
 - `wackyproc run <tool> [args...]`: Spawns `./tools/<tool>` as a detached background process and outputs its 4-character ID.
 - `wackyproc list [--json]`: Lists all tracked processes and their current status (`RUNNING`, `COMPLETED`, `FAILED`, `CRASHED`).
-- `wackyproc wait <seconds>`: Blocks up to N seconds for **any** tracked process to finish; returns the first completed process ID.
+- `wackyproc wait [seconds]`: Blocks up to N seconds (default 500) until a process that was **still running when the call began** finishes. Processes already terminal at entry are never reported, and the call blocks to the timeout when there is nothing pending, exiting non-zero.
+- `wackyproc wait --for <proc_id> [seconds]`: Blocks until that specific process finishes, reporting it immediately if it is already terminal. Fails immediately if the ID does not exist.
 - `wackyproc get <proc_id>`: Dumps captured stdout and stderr to the terminal.
 - `wackyproc stop <proc_id> [--timeout N]`: Gracefully stops the process group via `SIGTERM`, falling back to `SIGKILL`.
 

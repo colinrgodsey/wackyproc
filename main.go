@@ -19,6 +19,7 @@ var bundledWackyprocSkill string
 var (
 	jsonOutput  bool
 	stopTimeout int
+	waitFor     string
 )
 
 var rootCmd = &cobra.Command{
@@ -117,33 +118,53 @@ var listCmd = &cobra.Command{
 }
 
 var waitCmd = &cobra.Command{
-	Use:   "wait <seconds>",
-	Short: "Wait for any background process to reach a terminal state",
-	Long: `Blocks up to the specified timeout (in seconds) waiting for ANY tracked
+	Use:   "wait [seconds]",
+	Short: "Wait for a background process to reach a terminal state",
+	Long: `Blocks up to the specified timeout (in seconds) waiting for a tracked
 background process to finish (COMPLETED, FAILED, or CRASHED).
 
-Returns the process ID of whichever process completes first.
-If the timeout expires before any process finishes, outputs nothing.`,
-	Args: cobra.ExactArgs(1),
+In any-mode (default), waits for any process that was still running when the
+call began to reach a terminal state, ignoring processes already terminal at entry.
+If --for <id> is specified, waits for that specific process to complete (even if
+already terminal at entry).
+
+Returns the process ID of the completed process and exits 0.
+If the timeout expires before a process finishes, exits non-zero.`,
+	SilenceUsage: true,
+	Args:         cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return fmt.Errorf("failed to get current working directory: %w", err)
 		}
 
-		seconds, err := strconv.Atoi(args[0])
-		if err != nil {
-			return fmt.Errorf("invalid timeout seconds %q: %w", args[0], err)
+		timeoutSeconds := proc.MaxWaitSeconds
+		if len(args) == 1 {
+			var err error
+			timeoutSeconds, err = strconv.Atoi(args[0])
+			if err != nil {
+				return fmt.Errorf("invalid timeout seconds %q: %w", args[0], err)
+			}
 		}
 
-		procID, err := proc.Wait(cwd, seconds)
+		var targetID []string
+		if cmd.Flags().Changed("for") {
+			targetID = []string{waitFor}
+		}
+
+		procID, err := proc.Wait(cwd, timeoutSeconds, targetID...)
 		if err != nil {
 			return err
 		}
 
-		if procID != "" {
-			fmt.Println(procID)
+		if procID == "" {
+			if len(targetID) > 0 && targetID[0] != "" {
+				return fmt.Errorf("timeout waiting for process %q", targetID[0])
+			}
+			return fmt.Errorf("timeout waiting for process")
 		}
+
+		fmt.Println(procID)
 		return nil
 	},
 }
@@ -205,6 +226,7 @@ var skillCmd = &cobra.Command{
 func init() {
 	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output process list as JSON")
 	stopCmd.Flags().IntVar(&stopTimeout, "timeout", 3, "Seconds to wait after SIGTERM before sending SIGKILL")
+	waitCmd.Flags().StringVar(&waitFor, "for", "", "Wait for a specific process ID to reach a terminal state")
 
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(listCmd)

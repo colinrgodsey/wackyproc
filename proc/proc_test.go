@@ -2,6 +2,7 @@ package proc_test
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -585,5 +586,289 @@ done
 		if !strings.Contains(output, "ARG: "+expectedArg) {
 			t.Errorf("expected arg %q to be passed to tool, got output:\n%s", expectedArg, output)
 		}
+	}
+}
+
+func TestWait_AnyMode_IgnoresAlreadyTerminalProcesses(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "fast-finish", `exit 0`)
+	id, err := proc.Run(cwd, "fast-finish", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	// Wait until fast-finish has fully terminated
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		list, _ := proc.List(cwd)
+		if len(list) > 0 && list[0].Status == proc.StatusCompleted {
+			break
+		}
+	}
+
+	type result struct {
+		id  string
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		gotID, waitErr := proc.Wait(cwd, 1)
+		resCh <- result{id: gotID, err: waitErr}
+	}()
+
+	// Assert that Wait blocks and does not return the already-terminal process
+	select {
+	case res := <-resCh:
+		t.Fatalf("proc.Wait should have blocked and ignored already-terminal process %q, but returned immediately with id=%q, err=%v", id, res.id, res.err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: still blocked
+	}
+
+	// Assert completion after timeout (1 second clamped)
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("proc.Wait failed: %v", res.err)
+		}
+		if res.id != "" {
+			t.Fatalf("expected empty string on timeout, got %q (already-terminal process was incorrectly returned)", res.id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for proc.Wait to complete")
+	}
+}
+
+func TestWait_AnyMode_ReturnsProcessTransitioningToTerminal(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	// Create an already-terminal baseline process
+	createExecutable(t, cwd, "old-proc", `exit 0`)
+	oldID, err := proc.Run(cwd, "old-proc", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	// Wait until old-proc has fully terminated
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		list, _ := proc.List(cwd)
+		if len(list) > 0 && list[0].Status == proc.StatusCompleted {
+			break
+		}
+	}
+
+	// Create a controlled process that waits for a trigger file
+	triggerFile := filepath.Join(cwd, "trigger_any")
+	createExecutable(t, cwd, "controlled-any", fmt.Sprintf(`
+while [ ! -f %q ]; do
+  sleep 0.02
+done
+exit 0
+`, triggerFile))
+
+	controlledID, err := proc.Run(cwd, "controlled-any", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run controlled-any failed: %v", err)
+	}
+
+	type result struct {
+		id  string
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		gotID, waitErr := proc.Wait(cwd, 3)
+		resCh <- result{id: gotID, err: waitErr}
+	}()
+
+	// Assert that Wait blocks while controlled-any is still running
+	select {
+	case res := <-resCh:
+		t.Fatalf("proc.Wait returned prematurely: id=%q, err=%v", res.id, res.err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: still blocked
+	}
+
+	// Release the controlled process by creating the trigger file
+	if err := os.WriteFile(triggerFile, []byte("release"), 0644); err != nil {
+		t.Fatalf("failed to write trigger file: %v", err)
+	}
+
+	// Assert that Wait completes within bounded time and returns controlledID (not oldID!)
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("proc.Wait failed: %v", res.err)
+		}
+		if res.id == oldID {
+			t.Fatalf("proc.Wait incorrectly returned baseline process %q instead of %q", oldID, controlledID)
+		}
+		if res.id != controlledID {
+			t.Fatalf("expected completed ID %q, got %q", controlledID, res.id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for proc.Wait to detect completed process")
+	}
+}
+
+func TestWait_For_ReportsAlreadyTerminalImmediately(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "quick-target", `exit 0`)
+	id, err := proc.Run(cwd, "quick-target", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	// Wait until target is completed
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		list, _ := proc.List(cwd)
+		if len(list) > 0 && list[0].Status == proc.StatusCompleted {
+			break
+		}
+	}
+
+	type result struct {
+		id  string
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		gotID, waitErr := proc.Wait(cwd, 5, id)
+		resCh <- result{id: gotID, err: waitErr}
+	}()
+
+	// Baseline exclusion must NOT apply here: must report immediately rather than blocking
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("proc.Wait failed: %v", res.err)
+		}
+		if res.id != id {
+			t.Fatalf("expected ID %q, got %q", id, res.id)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected proc.Wait --for to return immediately on already-terminal process, but it blocked")
+	}
+}
+
+func TestWait_For_UnknownID_FailsImmediately(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	type result struct {
+		id  string
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		gotID, waitErr := proc.Wait(cwd, 5, "zz99")
+		resCh <- result{id: gotID, err: waitErr}
+	}()
+
+	// Must fail immediately with "process %q not found"
+	select {
+	case res := <-resCh:
+		if res.err == nil {
+			t.Fatal("expected error waiting for unknown process ID, got nil")
+		}
+		expectedErr := fmt.Sprintf("process %q not found", "zz99")
+		if res.err.Error() != expectedErr {
+			t.Fatalf("expected error %q, got %q", expectedErr, res.err.Error())
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("expected proc.Wait --for on unknown ID to fail immediately, but it blocked")
+	}
+}
+
+func TestWait_For_BlocksUntilTargetFinishes(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	triggerFile := filepath.Join(cwd, "trigger_for")
+	createExecutable(t, cwd, "controlled-for", fmt.Sprintf(`
+while [ ! -f %q ]; do
+  sleep 0.02
+done
+exit 0
+`, triggerFile))
+
+	targetID, err := proc.Run(cwd, "controlled-for", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	type result struct {
+		id  string
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		gotID, waitErr := proc.Wait(cwd, 5, targetID)
+		resCh <- result{id: gotID, err: waitErr}
+	}()
+
+	// Assert that Wait blocks while target is running
+	select {
+	case res := <-resCh:
+		t.Fatalf("proc.Wait returned prematurely: id=%q, err=%v", res.id, res.err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: still blocked
+	}
+
+	// Release target process
+	if err := os.WriteFile(triggerFile, []byte("release"), 0644); err != nil {
+		t.Fatalf("failed to write trigger file: %v", err)
+	}
+
+	// Assert that Wait completes within bounded time and returns targetID
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("proc.Wait failed: %v", res.err)
+		}
+		if res.id != targetID {
+			t.Fatalf("expected ID %q, got %q", targetID, res.id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for proc.Wait --for to complete")
+	}
+}
+
+func TestWait_NoTrackedProcesses_BlocksUntilTimeout(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	type result struct {
+		id  string
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		gotID, waitErr := proc.Wait(cwd, 1)
+		resCh <- result{id: gotID, err: waitErr}
+	}()
+
+	// Assert that Wait blocks instead of immediately erroring with "no tracked processes found"
+	select {
+	case res := <-resCh:
+		t.Fatalf("proc.Wait should have blocked, but returned immediately with id=%q, err=%v", res.id, res.err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: still blocked
+	}
+
+	// Assert completion after timeout (1 second clamped) with nil error and empty ID
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("expected nil error on empty tracked processes, got: %v", res.err)
+		}
+		if res.id != "" {
+			t.Fatalf("expected empty string on timeout, got: %q", res.id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for proc.Wait to complete")
 	}
 }
