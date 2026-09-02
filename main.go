@@ -20,6 +20,7 @@ var (
 	jsonOutput  bool
 	stopTimeout int
 	waitFor     string
+	peekLines   int
 )
 
 var rootCmd = &cobra.Command{
@@ -186,6 +187,28 @@ directly through wackyproc's own stdout and stderr.`,
 	},
 }
 
+var peekCmd = &cobra.Command{
+	Use:   "peek <proc_id> [--lines N]",
+	Short: "Show the trailing lines of captured stdout and stderr for a process",
+	Long: `Shows the trailing lines of captured stdout and stderr for the specified process ID
+directly through wackyproc's own stdout and stderr without marking the record as consumed.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		// CLI-layer validation fires first to reject invalid flag inputs before resolving cwd or process state.
+		if peekLines < 1 {
+			return fmt.Errorf("--lines must be >= 1")
+		}
+
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+
+		procID := args[0]
+		return proc.Peek(cwd, procID, peekLines, os.Stdout, os.Stderr)
+	},
+}
+
 var stopCmd = &cobra.Command{
 	Use:   "stop <proc_id>",
 	Short: "Stop a running background process group",
@@ -227,11 +250,13 @@ func init() {
 	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output process list as JSON")
 	stopCmd.Flags().IntVar(&stopTimeout, "timeout", 3, "Seconds to wait after SIGTERM before sending SIGKILL")
 	waitCmd.Flags().StringVar(&waitFor, "for", "", "Wait for a specific process ID to reach a terminal state")
+	peekCmd.Flags().IntVar(&peekLines, "lines", 20, "Number of trailing lines of stdout and stderr to show")
 
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(waitCmd)
 	rootCmd.AddCommand(getCmd)
+	rootCmd.AddCommand(peekCmd)
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(skillCmd)
 	rootCmd.AddCommand(superviseCmd)

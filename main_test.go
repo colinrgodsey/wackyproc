@@ -174,3 +174,157 @@ func TestWaitCmd_CLI_Success(t *testing.T) {
 		t.Errorf("expected stdout to contain %q, got %q", id, outBuf.String())
 	}
 }
+
+func clearPeekFlagState() {
+	if f := peekCmd.Flags().Lookup("lines"); f != nil {
+		f.Changed = false
+		_ = f.Value.Set("20")
+	}
+	peekLines = 20
+	rootCmd.SetOut(os.Stdout)
+	rootCmd.SetErr(os.Stderr)
+}
+
+func resetPeekFlags(t *testing.T) {
+	t.Helper()
+	clearPeekFlagState()
+	t.Cleanup(clearPeekFlagState)
+}
+
+func TestPeekCmd_CLI_Validation(t *testing.T) {
+	resetPeekFlags(t)
+
+	// Test --lines 0
+	rootCmd.SetArgs([]string{"peek", "xxxx", "--lines", "0"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for --lines 0, got nil")
+	}
+	if !strings.Contains(err.Error(), "--lines must be >= 1") {
+		t.Errorf("expected '--lines must be >= 1', got: %v", err)
+	}
+
+	// Test --lines negative
+	resetPeekFlags(t)
+	rootCmd.SetArgs([]string{"peek", "xxxx", "--lines", "-5"})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for --lines -5, got nil")
+	}
+	if !strings.Contains(err.Error(), "--lines must be >= 1") {
+		t.Errorf("expected '--lines must be >= 1', got: %v", err)
+	}
+
+	// Test missing argument
+	resetPeekFlags(t)
+	rootCmd.SetArgs([]string{"peek"})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for missing proc_id argument, got nil")
+	}
+
+	// Test too many arguments
+	resetPeekFlags(t)
+	rootCmd.SetArgs([]string{"peek", "a", "b"})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for too many arguments, got nil")
+	}
+}
+
+func TestPeekCmd_CLI_Execution(t *testing.T) {
+	resetPeekFlags(t)
+
+	tmpDir := t.TempDir()
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	toolsDir := filepath.Join(tmpDir, "tools")
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("mkdir tools: %v", err)
+	}
+	toolScript := "#!/bin/sh\nfor i in $(seq 1 25); do echo \"line $i\"; done\n"
+	if err := os.WriteFile(filepath.Join(toolsDir, "gen-lines"), []byte(toolScript), 0755); err != nil {
+		t.Fatalf("write tool: %v", err)
+	}
+
+	id, err := proc.Run(tmpDir, "gen-lines", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	// Wait for process to complete
+	if _, err := proc.Wait(tmpDir, 5); err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+
+	// 1. Default --lines (20)
+	{
+		resetPeekFlags(t)
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		origStdout := os.Stdout
+		os.Stdout = w
+
+		rootCmd.SetArgs([]string{"peek", id})
+		execErr := rootCmd.Execute()
+		w.Close()
+		os.Stdout = origStdout
+
+		var outBuf bytes.Buffer
+		_, _ = io.Copy(&outBuf, r)
+
+		if execErr != nil {
+			t.Fatalf("peek default failed: %v", execErr)
+		}
+
+		outStr := outBuf.String()
+		lines := strings.Split(strings.TrimSuffix(outStr, "\n"), "\n")
+		if len(lines) != 20 {
+			t.Errorf("expected 20 lines by default, got %d:\n%s", len(lines), outStr)
+		}
+		if lines[0] != "line 6" || lines[19] != "line 25" {
+			t.Errorf("expected lines 6 through 25, got start=%q end=%q", lines[0], lines[19])
+		}
+	}
+
+	// 2. Custom --lines 5
+	{
+		resetPeekFlags(t)
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		origStdout := os.Stdout
+		os.Stdout = w
+
+		rootCmd.SetArgs([]string{"peek", id, "--lines", "5"})
+		execErr := rootCmd.Execute()
+		w.Close()
+		os.Stdout = origStdout
+
+		var outBuf bytes.Buffer
+		_, _ = io.Copy(&outBuf, r)
+
+		if execErr != nil {
+			t.Fatalf("peek --lines 5 failed: %v", execErr)
+		}
+
+		outStr := outBuf.String()
+		lines := strings.Split(strings.TrimSuffix(outStr, "\n"), "\n")
+		if len(lines) != 5 {
+			t.Errorf("expected 5 lines, got %d:\n%s", len(lines), outStr)
+		}
+		if lines[0] != "line 21" || lines[4] != "line 25" {
+			t.Errorf("expected lines 21 through 25, got start=%q end=%q", lines[0], lines[4])
+		}
+	}
+}

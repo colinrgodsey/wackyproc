@@ -70,7 +70,16 @@ wackyproc get a1b2
 ```
 `wackyproc get` streams output through standard stdout and stderr. In `wackypub`, large output is automatically captured into scratchpad entries.
 
-### 5. Terminate a Process Group
+### 5. Peek at Latest Output (Without Full Retrieval)
+Check a long-running job's latest output cheaply without pulling a full dump:
+```bash
+wackyproc peek a1b2
+# Or specify how many trailing lines to inspect (default 20):
+wackyproc peek a1b2 --lines 50
+```
+`wackyproc peek` is a pure observer that reads the trailing lines and writes no state. Under future D79 consumption-order disposal, `get` will mark records as retrieved/consumed to make them eligible for disposal, whereas `peek` will never mark records consumed. Use `peek` to monitor progress or check recent errors while a process is still running or before deciding to retrieve full output.
+
+### 6. Terminate a Process Group
 Gracefully stop a running process and all its child processes:
 ```bash
 wackyproc stop a1b2

@@ -265,6 +265,67 @@ func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writ
 	return nil
 }
 
+// trailingLines returns the trailing n lines from data.
+// If data has fewer than n lines, the entire slice is returned.
+// A final line without a trailing newline is preserved as-is.
+func trailingLines(data []byte, n int) []byte {
+	if len(data) == 0 || n <= 0 {
+		return nil
+	}
+
+	end := len(data)
+	if data[len(data)-1] == '\n' {
+		end = len(data) - 1
+	}
+
+	count := 0
+	for i := end - 1; i >= 0; i-- {
+		if data[i] == '\n' {
+			count++
+			if count == n {
+				return data[i+1:]
+			}
+		}
+	}
+
+	return data
+}
+
+// Peek writes the trailing lines of captured stdout and stderr for procID to the provided writers.
+// A file with fewer than lines is output in full. A final line without a trailing newline is preserved.
+// Empty streams write nothing. It performs no state modification and does not mark the process record as consumed.
+func Peek(cwd string, procID string, lines int, stdoutWriter io.Writer, stderrWriter io.Writer) error {
+	// Package-level validation provides defense-in-depth for direct callers.
+	if lines < 1 {
+		return fmt.Errorf("--lines must be >= 1")
+	}
+
+	procDir := filepath.Join(cwd, ProcDirName, procID)
+	if _, err := os.Stat(procDir); os.IsNotExist(err) {
+		return fmt.Errorf("process %q not found", procID)
+	}
+
+	stdoutPath := filepath.Join(procDir, StdoutFileName)
+	if stdoutData, err := os.ReadFile(stdoutPath); err == nil && len(stdoutData) > 0 {
+		if tail := trailingLines(stdoutData, lines); len(tail) > 0 {
+			if _, err := stdoutWriter.Write(tail); err != nil {
+				return fmt.Errorf("failed to write stdout: %w", err)
+			}
+		}
+	}
+
+	stderrPath := filepath.Join(procDir, StderrFileName)
+	if stderrData, err := os.ReadFile(stderrPath); err == nil && len(stderrData) > 0 {
+		if tail := trailingLines(stderrData, lines); len(tail) > 0 {
+			if _, err := stderrWriter.Write(tail); err != nil {
+				return fmt.Errorf("failed to write stderr: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
 // clampWaitSeconds bounds a requested wait duration to [1, MaxWaitSeconds].
 // Letting a caller block indefinitely (or for an unreasonably long single
 // call) defeats the point of a process manager meant to avoid tying up a

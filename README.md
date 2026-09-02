@@ -19,6 +19,7 @@ In turn-based agent runtimes (like [wackypub](https://github.com/colinrgodsey/wa
 - `wackyproc wait [seconds]`: Blocks up to N seconds (default 500) until a process that was **still running when the call began** finishes. Processes already terminal at entry are never reported, and the call blocks to the timeout when there is nothing pending, exiting non-zero.
 - `wackyproc wait --for <proc_id> [seconds]`: Blocks until that specific process finishes, reporting it immediately if it is already terminal. Fails immediately if the ID does not exist.
 - `wackyproc get <proc_id>`: Dumps captured stdout and stderr to the terminal.
+- `wackyproc peek <proc_id> [--lines N]`: Show the trailing N lines (default 20) of captured stdout/stderr without a full dump, and does not mark the record consumed (forward-compatible with D79 consumption-order disposal, not yet implemented).
 - `wackyproc stop <proc_id> [--timeout N]`: Gracefully stops the process group via `SIGTERM`, falling back to `SIGKILL`.
 
 ## Build & Test

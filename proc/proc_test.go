@@ -872,3 +872,264 @@ func TestWait_NoTrackedProcesses_BlocksUntilTimeout(t *testing.T) {
 		t.Fatal("timed out waiting for proc.Wait to complete")
 	}
 }
+
+func TestPeek_UnknownProcID(t *testing.T) {
+	cwd := setupTestEnv(t)
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	err := proc.Peek(cwd, "xxxx", 20, &stdoutBuf, &stderrBuf)
+	if err == nil {
+		t.Fatal("expected error for unknown proc ID, got nil")
+	}
+	if !strings.Contains(err.Error(), `"xxxx"`) {
+		t.Errorf("expected error mentioning 'xxxx', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected 'not found' in error, got: %v", err)
+	}
+}
+
+func TestPeek_FewerLinesThanN(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "fewer-lines", `
+echo "stdout line 1"
+echo "stdout line 2"
+echo "stderr line 1" >&2
+`)
+
+	id, err := proc.Run(cwd, "fewer-lines", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	completedID, err := proc.Wait(cwd, 5)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if completedID != id {
+		t.Fatalf("expected ID %q, got %q", id, completedID)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if err := proc.Peek(cwd, id, 10, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Peek failed: %v", err)
+	}
+
+	expectedStdout := "stdout line 1\nstdout line 2\n"
+	expectedStderr := "stderr line 1\n"
+	if stdoutBuf.String() != expectedStdout {
+		t.Errorf("stdout = %q, want %q", stdoutBuf.String(), expectedStdout)
+	}
+	if stderrBuf.String() != expectedStderr {
+		t.Errorf("stderr = %q, want %q", stderrBuf.String(), expectedStderr)
+	}
+}
+
+func TestPeek_MoreLinesThanN(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "more-lines", `
+for i in 1 2 3 4 5; do
+  echo "out $i"
+  echo "err $i" >&2
+done
+`)
+
+	id, err := proc.Run(cwd, "more-lines", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	completedID, err := proc.Wait(cwd, 5)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if completedID != id {
+		t.Fatalf("expected ID %q, got %q", id, completedID)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	// Request exactly last 2 lines
+	if err := proc.Peek(cwd, id, 2, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Peek failed: %v", err)
+	}
+
+	expectedStdout := "out 4\nout 5\n"
+	expectedStderr := "err 4\nerr 5\n"
+	if stdoutBuf.String() != expectedStdout {
+		t.Errorf("stdout = %q, want %q", stdoutBuf.String(), expectedStdout)
+	}
+	if stderrBuf.String() != expectedStderr {
+		t.Errorf("stderr = %q, want %q", stderrBuf.String(), expectedStderr)
+	}
+}
+
+func TestPeek_FinalPartialLineWithoutNewline(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "partial-line", `
+printf "line 1\nline 2\npartial ending"
+`)
+
+	id, err := proc.Run(cwd, "partial-line", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	completedID, err := proc.Wait(cwd, 5)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if completedID != id {
+		t.Fatalf("expected ID %q, got %q", id, completedID)
+	}
+
+	// 1. Peek last 1 line -> should be exactly "partial ending"
+	var stdout1, stderr1 bytes.Buffer
+	if err := proc.Peek(cwd, id, 1, &stdout1, &stderr1); err != nil {
+		t.Fatalf("proc.Peek(1) failed: %v", err)
+	}
+	if got := stdout1.String(); got != "partial ending" {
+		t.Errorf("Peek(1) stdout = %q, want %q", got, "partial ending")
+	}
+
+	// 2. Peek last 2 lines -> should be "line 2\npartial ending"
+	var stdout2, stderr2 bytes.Buffer
+	if err := proc.Peek(cwd, id, 2, &stdout2, &stderr2); err != nil {
+		t.Fatalf("proc.Peek(2) failed: %v", err)
+	}
+	if got := stdout2.String(); got != "line 2\npartial ending" {
+		t.Errorf("Peek(2) stdout = %q, want %q", got, "line 2\npartial ending")
+	}
+
+	// 3. Peek with N > total lines -> should be full output
+	var stdoutAll, stderrAll bytes.Buffer
+	if err := proc.Peek(cwd, id, 10, &stdoutAll, &stderrAll); err != nil {
+		t.Fatalf("proc.Peek(10) failed: %v", err)
+	}
+	if got := stdoutAll.String(); got != "line 1\nline 2\npartial ending" {
+		t.Errorf("Peek(10) stdout = %q, want %q", got, "line 1\nline 2\npartial ending")
+	}
+}
+
+func TestPeek_EmptyStreams(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "silent-tool", `
+exit 0
+`)
+
+	id, err := proc.Run(cwd, "silent-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	completedID, err := proc.Wait(cwd, 5)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if completedID != id {
+		t.Fatalf("expected ID %q, got %q", id, completedID)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if err := proc.Peek(cwd, id, 20, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Peek failed: %v", err)
+	}
+
+	if stdoutBuf.Len() != 0 {
+		t.Errorf("expected empty stdout, got: %q", stdoutBuf.String())
+	}
+	if stderrBuf.Len() != 0 {
+		t.Errorf("expected empty stderr, got: %q", stderrBuf.String())
+	}
+}
+
+func TestPeek_InvalidLinesParam(t *testing.T) {
+	cwd := setupTestEnv(t)
+	var stdoutBuf, stderrBuf bytes.Buffer
+
+	for _, invalidLines := range []int{0, -1, -100} {
+		err := proc.Peek(cwd, "xxxx", invalidLines, &stdoutBuf, &stderrBuf)
+		if err == nil {
+			t.Errorf("expected error for lines=%d, got nil", invalidLines)
+		} else if !strings.Contains(err.Error(), "--lines must be >= 1") {
+			t.Errorf("expected '--lines must be >= 1', got: %v", err)
+		}
+	}
+}
+
+func TestPeek_PureReader_NoStateModified(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "state-tool", `
+echo "test output"
+`)
+
+	id, err := proc.Run(cwd, "state-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	completedID, err := proc.Wait(cwd, 5)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if completedID != id {
+		t.Fatalf("expected ID %q, got %q", id, completedID)
+	}
+
+	procDir := filepath.Join(cwd, proc.ProcDirName, id)
+	entriesBefore, err := os.ReadDir(procDir)
+	if err != nil {
+		t.Fatalf("readdir before: %v", err)
+	}
+	var filesBefore []string
+	for _, e := range entriesBefore {
+		filesBefore = append(filesBefore, e.Name())
+	}
+
+	metaBefore, err := os.ReadFile(filepath.Join(procDir, proc.MetaFileName))
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
+	}
+	exitBefore, err := os.ReadFile(filepath.Join(procDir, proc.ExitCodeFileName))
+	if err != nil {
+		t.Fatalf("read exit_code: %v", err)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if err := proc.Peek(cwd, id, 20, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Peek failed: %v", err)
+	}
+
+	entriesAfter, err := os.ReadDir(procDir)
+	if err != nil {
+		t.Fatalf("readdir after: %v", err)
+	}
+	var filesAfter []string
+	for _, e := range entriesAfter {
+		filesAfter = append(filesAfter, e.Name())
+	}
+
+	if strings.Join(filesBefore, ",") != strings.Join(filesAfter, ",") {
+		t.Errorf("procDir directory listing modified by Peek: before=%v, after=%v", filesBefore, filesAfter)
+	}
+
+	metaAfter, err := os.ReadFile(filepath.Join(procDir, proc.MetaFileName))
+	if err != nil {
+		t.Fatalf("read meta after: %v", err)
+	}
+	exitAfter, err := os.ReadFile(filepath.Join(procDir, proc.ExitCodeFileName))
+	if err != nil {
+		t.Fatalf("read exit_code after: %v", err)
+	}
+
+	if string(metaBefore) != string(metaAfter) {
+		t.Errorf("meta.json modified by Peek: before=%q, after=%q", string(metaBefore), string(metaAfter))
+	}
+	if string(exitBefore) != string(exitAfter) {
+		t.Errorf("exit_code modified by Peek: before=%q, after=%q", string(exitBefore), string(exitAfter))
+	}
+}
