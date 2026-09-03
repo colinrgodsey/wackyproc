@@ -226,6 +226,37 @@ followed by SIGKILL if the process group does not terminate within the timeout.`
 	},
 }
 
+var pruneCmd = &cobra.Command{
+	Use:   "prune",
+	Short: "Dispose all terminal background process records",
+	Long:  "Disposes all terminal (COMPLETED, FAILED, CRASHED) process records regardless of consumed state and reports removed IDs.",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+
+		return proc.Prune(cwd, os.Stdout)
+	},
+}
+
+var unconsumeCmd = &cobra.Command{
+	Use:   "unconsume <proc_id>",
+	Short: "Clear the consumed state of a process record",
+	Long:  "Clears the consumed sequence number of a process record so it can be preserved from auto-disposal.",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+
+		procID := args[0]
+		return proc.Unconsume(cwd, procID)
+	},
+}
+
 var superviseCmd = &cobra.Command{
 	Use:    "__supervise <proc_dir>",
 	Short:  "Internal supervisor runner (hidden)",
@@ -258,6 +289,8 @@ func init() {
 	rootCmd.AddCommand(getCmd)
 	rootCmd.AddCommand(peekCmd)
 	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(pruneCmd)
+	rootCmd.AddCommand(unconsumeCmd)
 	rootCmd.AddCommand(skillCmd)
 	rootCmd.AddCommand(superviseCmd)
 }

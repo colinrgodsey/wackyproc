@@ -328,3 +328,128 @@ func TestPeekCmd_CLI_Execution(t *testing.T) {
 		}
 	}
 }
+
+func TestPruneCmd_CLI(t *testing.T) {
+	tmpDir := t.TempDir()
+	toolsDir := filepath.Join(tmpDir, proc.ToolsDirName)
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("failed to create tools dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(toolsDir, "tool-p"), []byte("#!/bin/sh\necho done\n"), 0755); err != nil {
+		t.Fatalf("failed to write tool: %v", err)
+	}
+
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	id, err := proc.Run(tmpDir, "tool-p", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+	_, _ = proc.Wait(tmpDir, 5)
+
+	// 1. Happy path: prune with no args
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+
+	rootCmd.SetArgs([]string{"prune"})
+	execErr := rootCmd.Execute()
+	w.Close()
+	os.Stdout = origStdout
+
+	var outBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, r)
+
+	if execErr != nil {
+		t.Fatalf("prune command failed: %v", execErr)
+	}
+	if !strings.Contains(outBuf.String(), id) {
+		t.Errorf("expected prune output to mention %s, got: %q", id, outBuf.String())
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, proc.ProcDirName, id)); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be removed, but directory still exists", id)
+	}
+
+	// 2. Extra args rejected (cobra.NoArgs)
+	rootCmd.SetArgs([]string{"prune", "unexpected-arg"})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Errorf("expected error passing args to prune, got nil")
+	}
+}
+
+func TestUnconsumeCmd_CLI(t *testing.T) {
+	tmpDir := t.TempDir()
+	toolsDir := filepath.Join(tmpDir, proc.ToolsDirName)
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("failed to create tools dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(toolsDir, "tool-u"), []byte("#!/bin/sh\necho done\n"), 0755); err != nil {
+		t.Fatalf("failed to write tool: %v", err)
+	}
+
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	id, err := proc.Run(tmpDir, "tool-u", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+	_, _ = proc.Wait(tmpDir, 5)
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if err := proc.Get(tmpDir, id, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Get failed: %v", err)
+	}
+
+	metaPath := filepath.Join(tmpDir, proc.ProcDirName, id, proc.MetaFileName)
+	metaBytes, _ := os.ReadFile(metaPath)
+	if !strings.Contains(string(metaBytes), "consumed_seq") {
+		t.Fatalf("expected consumed_seq after get, got: %s", string(metaBytes))
+	}
+
+	// 1. Happy path: unconsume <id>
+	rootCmd.SetArgs([]string{"unconsume", id})
+	execErr := rootCmd.Execute()
+	if execErr != nil {
+		t.Fatalf("unconsume failed: %v", execErr)
+	}
+
+	metaBytes, _ = os.ReadFile(metaPath)
+	if strings.Contains(string(metaBytes), "consumed_seq") {
+		t.Errorf("expected consumed_seq to be removed after unconsume, got: %s", string(metaBytes))
+	}
+
+	// 2. Unknown ID
+	rootCmd.SetArgs([]string{"unconsume", "zz99"})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Fatalf("expected error for unknown ID, got nil")
+	}
+	if !strings.Contains(err.Error(), `process "zz99" not found`) {
+		t.Errorf("expected 'process \"zz99\" not found', got: %v", err)
+	}
+
+	// 3. Missing arg (ExactArgs(1))
+	rootCmd.SetArgs([]string{"unconsume"})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Errorf("expected error with 0 args, got nil")
+	}
+}

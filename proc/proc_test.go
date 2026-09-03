@@ -2,7 +2,9 @@ package proc_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1131,5 +1133,480 @@ echo "test output"
 	}
 	if string(exitBefore) != string(exitAfter) {
 		t.Errorf("exit_code modified by Peek: before=%q, after=%q", string(exitBefore), string(exitAfter))
+	}
+
+	var metaParsed proc.Meta
+	if err := json.Unmarshal(metaAfter, &metaParsed); err != nil {
+		t.Fatalf("unmarshal metaAfter: %v", err)
+	}
+	if metaParsed.ConsumedSeq != 0 {
+		t.Errorf("expected ConsumedSeq to be 0 after Peek, got %d", metaParsed.ConsumedSeq)
+	}
+	if strings.Contains(string(metaAfter), "consumed_seq") {
+		t.Errorf("expected consumed_seq to be omitted/absent from meta.json after Peek, got %q", string(metaAfter))
+	}
+}
+
+func seedProcessRecord(t *testing.T, cwd string, id string, tool string, status string, gen uint64, consumedSeq uint64) {
+	t.Helper()
+	procDir := filepath.Join(cwd, proc.ProcDirName, id)
+	if err := os.MkdirAll(procDir, 0755); err != nil {
+		t.Fatalf("failed to create proc dir %s: %v", id, err)
+	}
+	meta := proc.Meta{
+		ID:          id,
+		Tool:        tool,
+		StartedAt:   time.Now().Unix(),
+		Gen:         gen,
+		ConsumedSeq: consumedSeq,
+	}
+	metaData, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		t.Fatalf("failed to marshal meta: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(procDir, proc.MetaFileName), metaData, 0644); err != nil {
+		t.Fatalf("failed to write meta: %v", err)
+	}
+
+	if status != proc.StatusRunning {
+		exitCode := 0
+		if status == proc.StatusFailed {
+			exitCode = 1
+		} else if status == proc.StatusCrashed {
+			exitCode = proc.CrashedExitCode
+		}
+		_ = os.WriteFile(filepath.Join(procDir, proc.ExitCodeFileName), []byte(fmt.Sprintf("%d\n", exitCode)), 0644)
+	} else {
+		// Running process: point PID to current process so kill -0 returns 0 (running)
+		pid := os.Getpid()
+		_ = os.WriteFile(filepath.Join(procDir, proc.PIDFileName), []byte(fmt.Sprintf("%d\n", pid)), 0644)
+	}
+	_ = os.WriteFile(filepath.Join(procDir, proc.StdoutFileName), []byte("stdout\n"), 0644)
+	_ = os.WriteFile(filepath.Join(procDir, proc.StderrFileName), []byte("stderr\n"), 0644)
+}
+
+func TestGet_MarksTerminalConsumed(t *testing.T) {
+	cwd := setupTestEnv(t)
+	createExecutable(t, cwd, "quick-tool", "echo 'hello world'")
+
+	// 1. Terminal process: get marks consumed with monotonic sequence
+	id, err := proc.Run(cwd, "quick-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	completedID, err := proc.Wait(cwd, 5)
+	if err != nil || completedID != id {
+		t.Fatalf("proc.Wait failed: %v (id: %s)", err, completedID)
+	}
+
+	procDir := filepath.Join(cwd, proc.ProcDirName, id)
+	metaPath := filepath.Join(procDir, proc.MetaFileName)
+
+	var meta proc.Meta
+	metaBytes, _ := os.ReadFile(metaPath)
+	_ = json.Unmarshal(metaBytes, &meta)
+	if meta.ConsumedSeq != 0 {
+		t.Fatalf("expected ConsumedSeq to be 0 before get, got %d", meta.ConsumedSeq)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if err := proc.Get(cwd, id, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Get failed: %v", err)
+	}
+
+	metaBytes, _ = os.ReadFile(metaPath)
+	_ = json.Unmarshal(metaBytes, &meta)
+	seq1 := meta.ConsumedSeq
+	if seq1 == 0 {
+		t.Fatalf("expected ConsumedSeq to be > 0 after terminal get, got 0")
+	}
+
+	// 2. Second get: set-once, leaves ConsumedSeq unchanged
+	stdoutBuf.Reset()
+	stderrBuf.Reset()
+	if err := proc.Get(cwd, id, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("second proc.Get failed: %v", err)
+	}
+	metaBytes, _ = os.ReadFile(metaPath)
+	_ = json.Unmarshal(metaBytes, &meta)
+	if meta.ConsumedSeq != seq1 {
+		t.Errorf("expected ConsumedSeq to remain %d, got %d", seq1, meta.ConsumedSeq)
+	}
+
+	// 3. Unconsume clears ConsumedSeq
+	if err := proc.Unconsume(cwd, id); err != nil {
+		t.Fatalf("proc.Unconsume failed: %v", err)
+	}
+	metaBytes, _ = os.ReadFile(metaPath)
+	meta = proc.Meta{}
+	_ = json.Unmarshal(metaBytes, &meta)
+	if meta.ConsumedSeq != 0 {
+		t.Errorf("expected ConsumedSeq to be 0 after unconsume, got %d", meta.ConsumedSeq)
+	}
+	if strings.Contains(string(metaBytes), "consumed_seq") {
+		t.Errorf("expected consumed_seq to be omitted from JSON after unconsume, got %q", string(metaBytes))
+	}
+
+	// 4. Terminal get after unconsume assigns a FRESH (higher) sequence value
+	if err := proc.Get(cwd, id, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Get after unconsume failed: %v", err)
+	}
+	metaBytes, _ = os.ReadFile(metaPath)
+	meta = proc.Meta{}
+	_ = json.Unmarshal(metaBytes, &meta)
+	seq2 := meta.ConsumedSeq
+	if seq2 <= seq1 {
+		t.Errorf("expected fresh sequence seq2 (%d) > seq1 (%d)", seq2, seq1)
+	}
+
+	// 5. Running process: get leaves ConsumedSeq as 0
+	createExecutable(t, cwd, "sleep-tool", "sleep 10")
+	runningID, err := proc.Run(cwd, "sleep-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run sleep-tool failed: %v", err)
+	}
+	defer proc.Stop(cwd, runningID, 1)
+
+	runningMetaPath := filepath.Join(cwd, proc.ProcDirName, runningID, proc.MetaFileName)
+	if err := proc.Get(cwd, runningID, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Get on running process failed: %v", err)
+	}
+	metaBytes, _ = os.ReadFile(runningMetaPath)
+	var runningMeta proc.Meta
+	_ = json.Unmarshal(metaBytes, &runningMeta)
+	if runningMeta.ConsumedSeq != 0 {
+		t.Errorf("expected running process to have ConsumedSeq=0, got %d", runningMeta.ConsumedSeq)
+	}
+
+	// 6. Peek on terminal process leaves ConsumedSeq unchanged (0 if unconsumed)
+	peekID, err := proc.Run(cwd, "quick-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+	_, _ = proc.Wait(cwd, 5)
+	if err := proc.Peek(cwd, peekID, 10, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Peek failed: %v", err)
+	}
+	metaBytes, _ = os.ReadFile(filepath.Join(cwd, proc.ProcDirName, peekID, proc.MetaFileName))
+	var peekMeta proc.Meta
+	_ = json.Unmarshal(metaBytes, &peekMeta)
+	if peekMeta.ConsumedSeq != 0 {
+		t.Errorf("expected peek to leave ConsumedSeq=0, got %d", peekMeta.ConsumedSeq)
+	}
+}
+
+func TestSeq_ConcurrentAndGenOrdering(t *testing.T) {
+	cwd := setupTestEnv(t)
+	procBaseDir := filepath.Join(cwd, proc.ProcDirName)
+	if err := os.MkdirAll(procBaseDir, 0755); err != nil {
+		t.Fatalf("failed to create procBaseDir: %v", err)
+	}
+
+	// 1. N concurrent NextSeq calls yield N distinct values
+	const n = 50
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	seqs := make(map[uint64]bool)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			seq, err := proc.NextSeq(procBaseDir)
+			if err != nil {
+				t.Errorf("NextSeq failed: %v", err)
+				return
+			}
+			mu.Lock()
+			seqs[seq] = true
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if len(seqs) != n {
+		t.Errorf("expected %d distinct sequence numbers, got %d", n, len(seqs))
+	}
+
+	// 2. Gen ordering: two back-to-back spawns get distinct, ascending Gen even within the same second
+	createExecutable(t, cwd, "quick-tool", "echo 1")
+	idA, err := proc.Run(cwd, "quick-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("first proc.Run failed: %v", err)
+	}
+	idB, err := proc.Run(cwd, "quick-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("second proc.Run failed: %v", err)
+	}
+
+	metaBytesA, _ := os.ReadFile(filepath.Join(procBaseDir, idA, proc.MetaFileName))
+	metaBytesB, _ := os.ReadFile(filepath.Join(procBaseDir, idB, proc.MetaFileName))
+	var metaA, metaB proc.Meta
+	_ = json.Unmarshal(metaBytesA, &metaA)
+	_ = json.Unmarshal(metaBytesB, &metaB)
+
+	if metaB.Gen <= metaA.Gen {
+		t.Errorf("expected metaB.Gen (%d) > metaA.Gen (%d)", metaB.Gen, metaA.Gen)
+	}
+}
+
+func TestDisposal_RunAndListWarning(t *testing.T) {
+	cwd := setupTestEnv(t)
+	createExecutable(t, cwd, "quick-tool", "echo 1")
+
+	// Seed 105 terminal records:
+	// 10 consumed records (gens 1..10)
+	// 95 unconsumed records (gens 11..105)
+	// 1 running record
+	for i := 1; i <= 10; i++ {
+		id := fmt.Sprintf("c%03d", i)
+		seedProcessRecord(t, cwd, id, "tool-consumed", proc.StatusCompleted, uint64(i), uint64(i))
+	}
+	for i := 11; i <= 105; i++ {
+		id := fmt.Sprintf("u%03d", i)
+		seedProcessRecord(t, cwd, id, "tool-unconsumed", proc.StatusCompleted, uint64(i), 0)
+	}
+	seedProcessRecord(t, cwd, "r001", "tool-running", proc.StatusRunning, 106, 0)
+
+	// One more Run: spawns a process and runs disposal
+	newID, err := proc.Run(cwd, "quick-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+	_ = newID
+
+	// Disposal should have removed lowest-gen consumed records down to cap (100).
+	// We had 105 terminal records. Removing 5 consumed records brings it to 100.
+	// Records c001..c005 should be gone
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("c%03d", i)
+		p := filepath.Join(cwd, proc.ProcDirName, id)
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("expected consumed record %s to be auto-disposed, but it still exists", id)
+		}
+	}
+	// Records c006..c010 should still exist
+	for i := 6; i <= 10; i++ {
+		id := fmt.Sprintf("c%03d", i)
+		p := filepath.Join(cwd, proc.ProcDirName, id)
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			t.Errorf("expected consumed record %s to be preserved, but it was deleted", id)
+		}
+	}
+	// All 95 unconsumed records must still exist
+	for i := 11; i <= 105; i++ {
+		id := fmt.Sprintf("u%03d", i)
+		p := filepath.Join(cwd, proc.ProcDirName, id)
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			t.Errorf("expected unconsumed record %s to be preserved, but it was deleted", id)
+		}
+	}
+	// Running record must still exist
+	if _, err := os.Stat(filepath.Join(cwd, proc.ProcDirName, "r001")); os.IsNotExist(err) {
+		t.Errorf("expected running record r001 to be preserved, but it was deleted")
+	}
+
+	// 2. Cap exceeded and zero consumed terminals: nothing is disposed and List prints single stderr warning
+	cwd2 := setupTestEnv(t)
+	createExecutable(t, cwd2, "quick-tool", "echo 1")
+
+	// Seed 105 unconsumed terminal records
+	for i := 1; i <= 105; i++ {
+		id := fmt.Sprintf("x%03d", i)
+		seedProcessRecord(t, cwd2, id, "tool-unconsumed", proc.StatusCompleted, uint64(i), 0)
+	}
+
+	// Capture stderr around proc.List
+	oldStderr := os.Stderr
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	os.Stderr = wPipe
+
+	list, err := proc.List(cwd2)
+
+	_ = wPipe.Close()
+	os.Stderr = oldStderr
+
+	var stderrBuf bytes.Buffer
+	_, _ = io.Copy(&stderrBuf, rPipe)
+	_ = rPipe.Close()
+
+	if err != nil {
+		t.Fatalf("proc.List failed: %v", err)
+	}
+	if len(list) != 105 {
+		t.Errorf("expected 105 records in list, got %d", len(list))
+	}
+
+	stderrOut := stderrBuf.String()
+	if !strings.Contains(stderrOut, "105 terminal process records exceed cap of 100 with 0 disposable") {
+		t.Errorf("expected warning in stderr naming both counts, got: %q", stderrOut)
+	}
+	if !strings.Contains(stderrOut, "wackyproc prune") {
+		t.Errorf("expected warning to suggest 'wackyproc prune', got: %q", stderrOut)
+	}
+}
+
+func TestPrune(t *testing.T) {
+	cwd := setupTestEnv(t)
+	procBaseDir := filepath.Join(cwd, proc.ProcDirName)
+	_ = os.MkdirAll(procBaseDir, 0755)
+
+	// Seed 3 terminal records (mix consumed and unconsumed) and 1 running record
+	seedProcessRecord(t, cwd, "t001", "tool-a", proc.StatusCompleted, 1, 1)
+	seedProcessRecord(t, cwd, "t002", "tool-b", proc.StatusFailed, 2, 0)
+	seedProcessRecord(t, cwd, "t003", "tool-c", proc.StatusCrashed, 3, 2)
+	seedProcessRecord(t, cwd, "r001", "tool-run", proc.StatusRunning, 4, 0)
+
+	// Seed non-record items
+	_ = os.MkdirAll(filepath.Join(procBaseDir, proc.SeqLockDirName), 0755)
+	_ = os.WriteFile(filepath.Join(procBaseDir, proc.SeqFileName), []byte("4\n"), 0644)
+
+	var report bytes.Buffer
+	if err := proc.Prune(cwd, &report); err != nil {
+		t.Fatalf("proc.Prune failed: %v", err)
+	}
+
+	// Terminal records must be gone
+	for _, id := range []string{"t001", "t002", "t003"} {
+		if _, err := os.Stat(filepath.Join(procBaseDir, id)); !os.IsNotExist(err) {
+			t.Errorf("expected terminal record %s to be pruned, but it still exists", id)
+		}
+	}
+	// Running record must still exist
+	if _, err := os.Stat(filepath.Join(procBaseDir, "r001")); os.IsNotExist(err) {
+		t.Errorf("expected running record r001 to remain, but it was deleted")
+	}
+	// Non-record items must remain
+	if _, err := os.Stat(filepath.Join(procBaseDir, proc.SeqLockDirName)); os.IsNotExist(err) {
+		t.Errorf("expected .seq.lock to remain, but it was deleted")
+	}
+	if _, err := os.Stat(filepath.Join(procBaseDir, proc.SeqFileName)); os.IsNotExist(err) {
+		t.Errorf("expected .seq to remain, but it was deleted")
+	}
+
+	reportStr := report.String()
+	for _, id := range []string{"t001", "t002", "t003"} {
+		if !strings.Contains(reportStr, id) {
+			t.Errorf("expected prune report to contain %s, got: %q", id, reportStr)
+		}
+	}
+
+	// Empty .proc no-op
+	report.Reset()
+	if err := proc.Prune(cwd, &report); err != nil {
+		t.Fatalf("second proc.Prune failed: %v", err)
+	}
+	if report.Len() != 0 {
+		t.Errorf("expected empty report on second prune, got: %q", report.String())
+	}
+}
+
+func TestGet_JustRemovedRecordDir(t *testing.T) {
+	cwd := setupTestEnv(t)
+	createExecutable(t, cwd, "quick-tool", "echo 'quick'")
+
+	id, err := proc.Run(cwd, "quick-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+	_, _ = proc.Wait(cwd, 5)
+
+	// Simulate concurrent disposal right before Get
+	_ = os.RemoveAll(filepath.Join(cwd, proc.ProcDirName, id))
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	err = proc.Get(cwd, id, &stdoutBuf, &stderrBuf)
+	if err == nil {
+		t.Fatalf("expected error getting just-removed process, got nil")
+	}
+	expectedMsg := fmt.Sprintf("process %q not found", id)
+	if !strings.Contains(err.Error(), expectedMsg) {
+		t.Errorf("expected error %q, got: %v", expectedMsg, err)
+	}
+}
+
+func TestGet_MissingIndividualFiles(t *testing.T) {
+	// 1. Missing stdout: procDir exists, stderr and meta.json exist, stdout removed.
+	// Documented behavior: stdout write is skipped, Get succeeds, meta marked consumed.
+	{
+		cwd := setupTestEnv(t)
+		createExecutable(t, cwd, "tool-out", "echo out; echo err >&2")
+		id, err := proc.Run(cwd, "tool-out", nil, nil)
+		if err != nil {
+			t.Fatalf("proc.Run failed: %v", err)
+		}
+		_, _ = proc.Wait(cwd, 5)
+
+		procDir := filepath.Join(cwd, proc.ProcDirName, id)
+		_ = os.Remove(filepath.Join(procDir, proc.StdoutFileName))
+
+		var stdoutBuf, stderrBuf bytes.Buffer
+		err = proc.Get(cwd, id, &stdoutBuf, &stderrBuf)
+		if err != nil {
+			t.Errorf("expected Get with missing stdout to succeed, got: %v", err)
+		}
+		if stdoutBuf.Len() != 0 {
+			t.Errorf("expected empty stdout, got: %q", stdoutBuf.String())
+		}
+		if !strings.Contains(stderrBuf.String(), "err") {
+			t.Errorf("expected stderr to contain 'err', got: %q", stderrBuf.String())
+		}
+	}
+
+	// 2. Missing stderr: procDir exists, stdout and meta.json exist, stderr removed.
+	// Documented behavior: stderr write is skipped, Get succeeds, meta marked consumed.
+	{
+		cwd := setupTestEnv(t)
+		createExecutable(t, cwd, "tool-err", "echo out; echo err >&2")
+		id, err := proc.Run(cwd, "tool-err", nil, nil)
+		if err != nil {
+			t.Fatalf("proc.Run failed: %v", err)
+		}
+		_, _ = proc.Wait(cwd, 5)
+
+		procDir := filepath.Join(cwd, proc.ProcDirName, id)
+		_ = os.Remove(filepath.Join(procDir, proc.StderrFileName))
+
+		var stdoutBuf, stderrBuf bytes.Buffer
+		err = proc.Get(cwd, id, &stdoutBuf, &stderrBuf)
+		if err != nil {
+			t.Errorf("expected Get with missing stderr to succeed, got: %v", err)
+		}
+		if !strings.Contains(stdoutBuf.String(), "out") {
+			t.Errorf("expected stdout to contain 'out', got: %q", stdoutBuf.String())
+		}
+		if stderrBuf.Len() != 0 {
+			t.Errorf("expected empty stderr, got: %q", stderrBuf.String())
+		}
+	}
+
+	// 3. Missing meta.json (e.g. concurrent disposal between initial stat and meta read):
+	// procDir exists, stdout exists, but meta.json removed.
+	// Documented behavior: must return 'process "<id>" not found' error.
+	{
+		cwd := setupTestEnv(t)
+		createExecutable(t, cwd, "tool-meta", "echo out")
+		id, err := proc.Run(cwd, "tool-meta", nil, nil)
+		if err != nil {
+			t.Fatalf("proc.Run failed: %v", err)
+		}
+		_, _ = proc.Wait(cwd, 5)
+
+		procDir := filepath.Join(cwd, proc.ProcDirName, id)
+		_ = os.Remove(filepath.Join(procDir, proc.MetaFileName))
+
+		var stdoutBuf, stderrBuf bytes.Buffer
+		err = proc.Get(cwd, id, &stdoutBuf, &stderrBuf)
+		if err == nil {
+			t.Fatalf("expected error for missing meta.json, got nil")
+		}
+		expectedMsg := fmt.Sprintf("process %q not found", id)
+		if !strings.Contains(err.Error(), expectedMsg) {
+			t.Errorf("expected %q error, got: %v", expectedMsg, err)
+		}
 	}
 }

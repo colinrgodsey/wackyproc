@@ -68,7 +68,7 @@ Read the full captured stdout and stderr streams:
 ```bash
 wackyproc get a1b2
 ```
-`wackyproc get` streams output through standard stdout and stderr. In `wackypub`, large output is automatically captured into scratchpad entries.
+`wackyproc get` streams output through standard stdout and stderr. In `wackypub`, large output is automatically captured into scratchpad entries. Retrieving output marks terminal process records as consumed, making them eligible for automatic disposal when the terminal record cap (100) is exceeded. To clear the consumed state and protect a record from disposal, run `wackyproc unconsume <id>`.
 
 ### 5. Peek at Latest Output (Without Full Retrieval)
 Check a long-running job's latest output cheaply without pulling a full dump:
@@ -77,7 +77,7 @@ wackyproc peek a1b2
 # Or specify how many trailing lines to inspect (default 20):
 wackyproc peek a1b2 --lines 50
 ```
-`wackyproc peek` is a pure observer that reads the trailing lines and writes no state. Under future D79 consumption-order disposal, `get` will mark records as retrieved/consumed to make them eligible for disposal, whereas `peek` will never mark records consumed. Use `peek` to monitor progress or check recent errors while a process is still running or before deciding to retrieve full output.
+`wackyproc peek` is a pure observer that reads trailing lines and writes no state. Unlike `get`, `peek` never marks records as consumed. Use `peek` to monitor progress or check recent errors while a process is still running or before deciding to retrieve full output.
 
 ### 6. Terminate a Process Group
 Gracefully stop a running process and all its child processes:
@@ -86,6 +86,18 @@ wackyproc stop a1b2
 # Or specify a custom timeout (in seconds) before SIGKILL:
 wackyproc stop a1b2 --timeout 5
 ```
+
+### 7. Clean Up & Manage Process Records
+`wackyproc run` automatically disposes the oldest consumed terminal records when terminal records exceed the cap (100). Unconsumed terminal records are never auto-disposed.
+
+- **Prune all finished jobs**: Manually dispose all terminal records regardless of consumed state:
+  ```bash
+  wackyproc prune
+  ```
+- **Unconsume a record**: Clear the consumed marker so a record is protected from auto-disposal:
+  ```bash
+  wackyproc unconsume a1b2
+  ```
 
 ---
 
@@ -117,4 +129,4 @@ wackyproc stop a1b2 --timeout 5
    wackyproc get <id>
    ```
 3. **Clean Up Finished Jobs**:
-   There is no `wackyproc` command for this yet - finished job logs and metadata remain on disk in `.proc/<id>/` indefinitely until removed by another means (e.g. `files-rw delete` or a shell tool, if linked). Unlike wackypub's own scratchpad system, `.proc/` has no automatic eviction, so a long-running workspace with many `wackyproc run` calls will accumulate state over time.
+   Run `wackyproc prune` to clean up all terminal processes on demand. `wackyproc run` will also automatically evict consumed terminal processes in creation order once the cap of 100 terminal records is reached.

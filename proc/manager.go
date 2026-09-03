@@ -141,7 +141,13 @@ func Run(cwd string, toolName string, args []string, stdinReader io.Reader) (str
 		}
 	}
 
-	// 4. Write initial meta.json
+	// 4. Allocate monotonic generation number and write initial meta.json
+	gen, err := nextSeq(procBaseDir)
+	if err != nil {
+		_ = os.RemoveAll(procDir)
+		return "", fmt.Errorf("failed to allocate sequence generation: %w", err)
+	}
+
 	meta := Meta{
 		ID:        procID,
 		Tool:      toolName,
@@ -149,6 +155,7 @@ func Run(cwd string, toolName string, args []string, stdinReader io.Reader) (str
 		Args:      args,
 		Cwd:       cwd,
 		StartedAt: time.Now().Unix(),
+		Gen:       gen,
 	}
 	metaBytes, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -182,7 +189,81 @@ func Run(cwd string, toolName string, args []string, stdinReader io.Reader) (str
 		return "", fmt.Errorf("failed to detach supervisor: %w", err)
 	}
 
+	// Post-spawn disposal of consumed terminal records exceeding cap (D79)
+	disposeConsumedTerminals(procBaseDir)
+
 	return procID, nil
+}
+
+func isTerminal(status string) bool {
+	return status == StatusCompleted || status == StatusFailed || status == StatusCrashed
+}
+
+type consumedTerminalRecord struct {
+	id   string
+	gen  uint64
+	path string
+}
+
+// disposeConsumedTerminals disposes consumed terminal records in ascending Gen order
+// if the total terminal record count exceeds MaxTerminalEntries.
+// Unconsumed terminal records and RUNNING processes are NEVER auto-disposed.
+func disposeConsumedTerminals(procBaseDir string) {
+	entries, err := os.ReadDir(procBaseDir)
+	if err != nil {
+		return
+	}
+
+	var terminalCount int
+	var consumedTerminals []consumedTerminalRecord
+
+	for _, entry := range entries {
+		if !entry.IsDir() || !IsProcessRecordDir(entry.Name()) {
+			continue
+		}
+		procDir := filepath.Join(procBaseDir, entry.Name())
+		metaBytes, err := os.ReadFile(filepath.Join(procDir, MetaFileName))
+		if err != nil {
+			continue
+		}
+		var meta Meta
+		if err := json.Unmarshal(metaBytes, &meta); err != nil {
+			continue
+		}
+
+		status, _, _, _, _ := CheckLiveness(procDir, &meta)
+		if isTerminal(status) {
+			terminalCount++
+			if meta.ConsumedSeq > 0 {
+				consumedTerminals = append(consumedTerminals, consumedTerminalRecord{
+					id:   meta.ID,
+					gen:  meta.Gen,
+					path: procDir,
+				})
+			}
+		}
+	}
+
+	if terminalCount <= MaxTerminalEntries || len(consumedTerminals) == 0 {
+		return
+	}
+
+	// Sort consumed terminals by Gen ascending (lowest gen / oldest creation first)
+	sort.Slice(consumedTerminals, func(i, j int) bool {
+		return consumedTerminals[i].gen < consumedTerminals[j].gen
+	})
+
+	for _, rec := range consumedTerminals {
+		if terminalCount <= MaxTerminalEntries {
+			break
+		}
+		// Accepted race: another process may be reading this record while we remove it.
+		// Get already returns 'process "id" not found' when os.Stat fails or files disappear,
+		// so concurrent reads cleanly return not-found rather than crashing or returning partial output.
+		if err := os.RemoveAll(rec.path); err == nil {
+			terminalCount--
+		}
+	}
 }
 
 // List inspects all process directories in <cwd>/.proc/ and returns their status.
@@ -197,8 +278,11 @@ func List(cwd string) ([]ProcessInfo, error) {
 	}
 
 	var results []ProcessInfo
+	var terminalCount int
+	var consumedTerminalCount int
+
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || !IsProcessRecordDir(entry.Name()) {
 			continue
 		}
 		procID := entry.Name()
@@ -212,6 +296,13 @@ func List(cwd string) ([]ProcessInfo, error) {
 		status, pid, pgid, exitCode, err := CheckLiveness(procDir, &meta)
 		if err != nil {
 			continue
+		}
+
+		if isTerminal(status) {
+			terminalCount++
+			if meta.ConsumedSeq > 0 {
+				consumedTerminalCount++
+			}
 		}
 
 		toolName := meta.Tool
@@ -231,6 +322,10 @@ func List(cwd string) ([]ProcessInfo, error) {
 		})
 	}
 
+	if terminalCount > MaxTerminalEntries && consumedTerminalCount == 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d terminal process records exceed cap of %d with 0 disposable; run 'wackyproc prune' to clear\n", terminalCount, MaxTerminalEntries)
+	}
+
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].StartedAt < results[j].StartedAt
 	})
@@ -242,6 +337,8 @@ func List(cwd string) ([]ProcessInfo, error) {
 }
 
 // Get dumps captured stdout and stderr for procID to the provided writers.
+// When reading a terminal process for the first time (ConsumedSeq == 0), marks it as consumed
+// with a monotonic sequence number.
 func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writer) error {
 	procDir := filepath.Join(cwd, ProcDirName, procID)
 	if _, err := os.Stat(procDir); os.IsNotExist(err) {
@@ -259,6 +356,50 @@ func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writ
 	if stderrData, err := os.ReadFile(stderrPath); err == nil && len(stderrData) > 0 {
 		if _, err := stderrWriter.Write(stderrData); err != nil {
 			return fmt.Errorf("failed to write stderr: %w", err)
+		}
+	}
+
+	// Output write succeeded. Now check if record should be marked as consumed (D79).
+	metaPath := filepath.Join(procDir, MetaFileName)
+	metaBytes, err := os.ReadFile(metaPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("process %q not found", procID)
+		}
+		fmt.Fprintf(os.Stderr, "warning: failed to read %s for process %q: %v\n", MetaFileName, procID, err)
+		return nil
+	}
+
+	var meta Meta
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to parse %s for process %q: %v\n", MetaFileName, procID, err)
+		return nil
+	}
+
+	status, _, _, _, _ := CheckLiveness(procDir, &meta)
+	if isTerminal(status) && meta.ConsumedSeq == 0 {
+		seq, err := nextSeq(filepath.Join(cwd, ProcDirName))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to allocate consumed sequence for process %q: %v\n", procID, err)
+			return nil
+		}
+		meta.ConsumedSeq = seq
+
+		updatedBytes, err := json.MarshalIndent(meta, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to serialize %s for process %q: %v\n", MetaFileName, procID, err)
+			return nil
+		}
+
+		tmpPath := filepath.Join(procDir, fmt.Sprintf("meta.json.tmp.%d", time.Now().UnixNano()))
+		if err := os.WriteFile(tmpPath, updatedBytes, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to write %s for process %q: %v\n", tmpPath, procID, err)
+			return nil
+		}
+		if err := os.Rename(tmpPath, metaPath); err != nil {
+			_ = os.Remove(tmpPath)
+			fmt.Fprintf(os.Stderr, "warning: failed to rename %s for process %q: %v\n", MetaFileName, procID, err)
+			return nil
 		}
 	}
 
@@ -340,10 +481,6 @@ func clampWaitSeconds(requested int) int {
 		return MaxWaitSeconds
 	}
 	return requested
-}
-
-func isTerminal(status string) bool {
-	return status == StatusCompleted || status == StatusFailed || status == StatusCrashed
 }
 
 // Wait blocks up to timeoutSeconds for a background process to reach a terminal state.
@@ -483,5 +620,88 @@ func Stop(cwd string, procID string, timeoutSeconds int) error {
 	_ = syscall.Kill(target, syscall.SIGKILL)
 	time.Sleep(50 * time.Millisecond)
 	_, _, _, _, _ = CheckLiveness(procDir, &meta)
+	return nil
+}
+
+// Prune disposes ALL terminal (COMPLETED, FAILED, CRASHED) process records regardless of consumed state.
+// Reports each removed process ID and tool to report. RUNNING processes are untouched.
+// If .proc/ does not exist or has no terminal records, Prune is a clean no-op.
+func Prune(cwd string, report io.Writer) error {
+	procBaseDir := filepath.Join(cwd, ProcDirName)
+	entries, err := os.ReadDir(procBaseDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read %s directory: %w", ProcDirName, err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || !IsProcessRecordDir(entry.Name()) {
+			continue
+		}
+		procID := entry.Name()
+		procDir := filepath.Join(procBaseDir, procID)
+
+		var meta Meta
+		if metaBytes, err := os.ReadFile(filepath.Join(procDir, MetaFileName)); err == nil {
+			_ = json.Unmarshal(metaBytes, &meta)
+		}
+
+		toolName := meta.Tool
+		if toolName == "" {
+			toolName = procID
+		}
+
+		status, _, _, _, _ := CheckLiveness(procDir, &meta)
+		if isTerminal(status) {
+			if err := os.RemoveAll(procDir); err != nil {
+				return fmt.Errorf("failed to remove process record %s: %w", procID, err)
+			}
+			if report != nil {
+				fmt.Fprintf(report, "pruned %s (%s)\n", procID, toolName)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Unconsume clears the ConsumedSeq of a process record.
+// If procID does not exist, returns the standard 'process %q not found' error.
+// Works on running records too (clears preemptively).
+func Unconsume(cwd string, procID string) error {
+	procDir := filepath.Join(cwd, ProcDirName, procID)
+	if _, err := os.Stat(procDir); os.IsNotExist(err) {
+		return fmt.Errorf("process %q not found", procID)
+	}
+
+	metaPath := filepath.Join(procDir, MetaFileName)
+	metaBytes, err := os.ReadFile(metaPath)
+	if err != nil {
+		return fmt.Errorf("failed to read %s for process %q: %w", MetaFileName, procID, err)
+	}
+
+	var meta Meta
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		return fmt.Errorf("failed to parse %s for process %q: %w", MetaFileName, procID, err)
+	}
+
+	meta.ConsumedSeq = 0
+
+	updatedBytes, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize %s: %w", MetaFileName, err)
+	}
+
+	tmpPath := filepath.Join(procDir, fmt.Sprintf("meta.json.tmp.%d", time.Now().UnixNano()))
+	if err := os.WriteFile(tmpPath, updatedBytes, 0644); err != nil {
+		return fmt.Errorf("failed to write temporary %s: %w", MetaFileName, err)
+	}
+	if err := os.Rename(tmpPath, metaPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to update %s: %w", MetaFileName, err)
+	}
+
 	return nil
 }

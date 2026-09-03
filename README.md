@@ -18,8 +18,10 @@ In turn-based agent runtimes (like [wackypub](https://github.com/colinrgodsey/wa
 - `wackyproc list [--json]`: Lists all tracked processes and their current status (`RUNNING`, `COMPLETED`, `FAILED`, `CRASHED`).
 - `wackyproc wait [seconds]`: Blocks up to N seconds (default 500) until a process that was **still running when the call began** finishes. Processes already terminal at entry are never reported, and the call blocks to the timeout when there is nothing pending, exiting non-zero.
 - `wackyproc wait --for <proc_id> [seconds]`: Blocks until that specific process finishes, reporting it immediately if it is already terminal. Fails immediately if the ID does not exist.
-- `wackyproc get <proc_id>`: Dumps captured stdout and stderr to the terminal.
-- `wackyproc peek <proc_id> [--lines N]`: Show the trailing N lines (default 20) of captured stdout/stderr without a full dump, and does not mark the record consumed (forward-compatible with D79 consumption-order disposal, not yet implemented).
+- `wackyproc get <proc_id>`: Dumps captured stdout and stderr to the terminal and marks terminal records as consumed (retrieval = consumption).
+- `wackyproc peek <proc_id> [--lines N]`: Shows the trailing N lines (default 20) of captured stdout/stderr without a full dump, and never marks the record as consumed (unlike `get`).
+- `wackyproc unconsume <proc_id>`: Clears the consumed sequence number of a process record, preserving it from auto-disposal.
+- `wackyproc prune`: Disposes all terminal process records regardless of consumed state and reports removed IDs.
 - `wackyproc stop <proc_id> [--timeout N]`: Gracefully stops the process group via `SIGTERM`, falling back to `SIGKILL`.
 
 ## Build & Test
