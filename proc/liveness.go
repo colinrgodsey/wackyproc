@@ -56,8 +56,20 @@ func CheckLiveness(procDir string, meta *Meta) (status string, pid int, pgid int
 		}
 	}
 
-	// 1. Check if exit_code file exists
+	crashedPath := filepath.Join(procDir, CrashedFileName)
 	exitCodePath := filepath.Join(procDir, ExitCodeFileName)
+
+	// 1. Check if crashed marker file exists
+	if _, err := os.Stat(crashedPath); err == nil {
+		if exitData, err := os.ReadFile(exitCodePath); err == nil {
+			if code, err := strconv.Atoi(strings.TrimSpace(string(exitData))); err == nil {
+				exitCode = &code
+			}
+		}
+		return StatusCrashed, pid, pgid, exitCode, nil
+	}
+
+	// 2. Check if exit_code file exists
 	if exitData, err := os.ReadFile(exitCodePath); err == nil {
 		code, err := strconv.Atoi(strings.TrimSpace(string(exitData)))
 		if err == nil {
@@ -74,7 +86,7 @@ func CheckLiveness(procDir string, meta *Meta) (status string, pid int, pgid int
 		return StatusRunning, pid, pgid, nil, nil
 	}
 
-	// 2. Zero-signal liveness check (kill -0 <pid>)
+	// 3. Zero-signal liveness check (kill -0 <pid>)
 	process, err := os.FindProcess(pid)
 	if err != nil || process.Signal(syscall.Signal(0)) != nil {
 		// If child process just terminated, check if supervisor is still alive and finalizing exit_code
@@ -87,7 +99,15 @@ func CheckLiveness(procDir string, meta *Meta) (status string, pid int, pgid int
 			}
 		}
 
-		// Re-check if exit_code was written in the interim
+		// Re-check if crashed marker or exit_code was written in the interim
+		if _, err := os.Stat(crashedPath); err == nil {
+			if exitData, err := os.ReadFile(exitCodePath); err == nil {
+				if code, err := strconv.Atoi(strings.TrimSpace(string(exitData))); err == nil {
+					exitCode = &code
+				}
+			}
+			return StatusCrashed, pid, pgid, exitCode, nil
+		}
 		if exitData, err := os.ReadFile(exitCodePath); err == nil {
 			code, err := strconv.Atoi(strings.TrimSpace(string(exitData)))
 			if err == nil {
@@ -100,19 +120,17 @@ func CheckLiveness(procDir string, meta *Meta) (status string, pid int, pgid int
 		}
 
 		// Process and supervisor are both dead without writing exit_code
-		crashedCode := CrashedExitCode
-		_ = os.WriteFile(exitCodePath, []byte(strconv.Itoa(crashedCode)+"\n"), 0644)
-		return StatusCrashed, pid, pgid, &crashedCode, nil
+		_ = os.WriteFile(crashedPath, []byte(""), 0644)
+		return StatusCrashed, pid, pgid, nil, nil
 	}
 
-	// 3. Start-time verification to detect PID reuse
+	// 4. Start-time verification to detect PID reuse
 	if meta != nil && meta.StartTime != "" {
 		currentStartTime := GetProcessStartTime(pid)
 		if currentStartTime != "" && currentStartTime != meta.StartTime {
 			// PID was recycled by another process!
-			crashedCode := CrashedExitCode
-			_ = os.WriteFile(exitCodePath, []byte(strconv.Itoa(crashedCode)+"\n"), 0644)
-			return StatusCrashed, pid, pgid, &crashedCode, nil
+			_ = os.WriteFile(crashedPath, []byte(""), 0644)
+			return StatusCrashed, pid, pgid, nil, nil
 		}
 	}
 

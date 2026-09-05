@@ -175,6 +175,106 @@ func TestWaitCmd_CLI_Success(t *testing.T) {
 	}
 }
 
+func TestWaitCmd_CLI_NegativeTimeout(t *testing.T) {
+	resetWaitFlags(t)
+
+	tests := []struct {
+		name        string
+		args        []string
+		expectError string
+	}{
+		{
+			name:        "bare negative timeout",
+			args:        []string{"wait", "-5"},
+			expectError: "wait: timeout must be a non-negative integer (got -5)",
+		},
+		{
+			name:        "targeted negative timeout",
+			args:        []string{"wait", "--for", "anyid", "-5"},
+			expectError: "wait: timeout must be a non-negative integer (got -5)",
+		},
+		{
+			name:        "positional negative timeout via separator",
+			args:        []string{"wait", "--", "-5"},
+			expectError: "wait: timeout must be a non-negative integer (got -5)",
+		},
+		{
+			name:        "non-integer flag returns original error",
+			args:        []string{"wait", "-x"},
+			expectError: "unknown shorthand flag: 'x' in -x",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resetWaitFlags(t)
+			var stdoutBuf, stderrBuf bytes.Buffer
+			rootCmd.SetOut(&stdoutBuf)
+			rootCmd.SetErr(&stderrBuf)
+			rootCmd.SetArgs(tc.args)
+
+			err := rootCmd.Execute()
+			if err == nil {
+				t.Fatalf("expected error for args %v, got nil", tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.expectError) {
+				t.Errorf("expected error containing %q, got %q", tc.expectError, err.Error())
+			}
+		})
+	}
+}
+
+func TestWaitCmd_CLI_ZeroTimeout_Succeeds(t *testing.T) {
+	resetWaitFlags(t)
+
+	tmpDir := t.TempDir()
+	toolsDir := filepath.Join(tmpDir, proc.ToolsDirName)
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("failed to create tools dir: %v", err)
+	}
+	scriptPath := filepath.Join(toolsDir, "instant-exit")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("failed to write instant-exit: %v", err)
+	}
+
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	id, err := proc.Run(tmpDir, "instant-exit", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = origStdout }()
+
+	rootCmd.SetArgs([]string{"wait", "0"})
+	execErr := rootCmd.Execute()
+
+	w.Close()
+
+	var outBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, r)
+
+	if execErr != nil {
+		t.Fatalf("rootCmd.Execute failed: %v", execErr)
+	}
+	if !strings.Contains(outBuf.String(), id) {
+		t.Errorf("expected stdout to contain %q, got %q", id, outBuf.String())
+	}
+}
+
 func clearPeekFlagState() {
 	if f := peekCmd.Flags().Lookup("lines"); f != nil {
 		f.Changed = false
