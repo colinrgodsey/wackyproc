@@ -56,12 +56,15 @@ wackyproc list --json
 ```
 
 ### 3. Wait for Background Jobs to Finish
-Block up to `N` seconds for **any** tracked background process to complete:
+Block up to `N` seconds for background processes to reach a terminal state:
 ```bash
+# Any-mode: wait for ANY process still running at call start
 wackyproc wait 10
-# Output: a1b2
+
+# Targeted: wait for a specific process (returns immediately if already terminal)
+wackyproc wait --for a1b2 10
 ```
-If a process finishes within 10 seconds, its ID is printed immediately. Requests longer than 500 seconds are silently capped at 500 - call `wait` again if nothing finished in time rather than requesting a single very long wait.
+Processes already terminal at entry are invisible to any-mode `wait` (use `--for` + `get` instead). Requests longer than 500 seconds are silently capped at 500 - call `wait` again if nothing finished in time rather than requesting a single very long wait.
 
 ### 4. Retrieve Output (Stdout & Stderr)
 Read the full captured stdout and stderr streams:
@@ -108,7 +111,7 @@ wackyproc stop a1b2 --timeout 5
 | **`RUNNING`** | Target process and its supervisor are actively executing. |
 | **`COMPLETED`** | Process exited normally with exit code `0`. |
 | **`FAILED`** | Process exited with a non-zero exit code (e.g. `1`, `42`). |
-| **`CRASHED`** | Process died abruptly (OOM killer, `SIGKILL`, host reboot) without recording an exit code (recorded as `137`). |
+| **`CRASHED`** | Process died abruptly (OOM killer, `SIGKILL`, host reboot) without recording an exit code. |
 
 ---
 

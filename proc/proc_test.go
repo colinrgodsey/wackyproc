@@ -435,11 +435,21 @@ func TestSkill_FileContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read skill file %s: %v", skillPath, err)
 	}
-	if !strings.Contains(string(content), "name: wackyproc") {
+	skillStr := string(content)
+	if !strings.Contains(skillStr, "name: wackyproc") {
 		t.Errorf("expected skill to contain 'name: wackyproc'")
 	}
-	if !strings.Contains(string(content), "# WackyProc Process Management & Long-Running Command Guide") {
+	if !strings.Contains(skillStr, "# WackyProc Process Management & Long-Running Command Guide") {
 		t.Errorf("expected skill to contain guide title")
+	}
+	if !strings.Contains(skillStr, "wackyproc wait --for") {
+		t.Errorf("expected skill to document 'wackyproc wait --for'")
+	}
+	if !strings.Contains(skillStr, "invisible to any-mode") {
+		t.Errorf("expected skill to document terminal-at-entry invisibility contract")
+	}
+	if strings.Contains(skillStr, "(recorded as 137)") {
+		t.Errorf("expected skill to drop obsolete '(recorded as 137)'")
 	}
 }
 
