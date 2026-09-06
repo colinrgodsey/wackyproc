@@ -315,8 +315,14 @@ func TestPIDReuseDetection(t *testing.T) {
 	}
 
 	// Should be marked CRASHED because the recorded start time doesn't match the current process start time
-	if status != proc.StatusCrashed || exitCode == nil || *exitCode != proc.CrashedExitCode {
-		t.Errorf("expected CRASHED with 137 due to start time mismatch, got status=%s, exit=%v", status, exitCode)
+	if status != proc.StatusCrashed || exitCode != nil {
+		t.Errorf("expected CRASHED with nil exitCode due to start time mismatch, got status=%s, exit=%v", status, exitCode)
+	}
+	if _, err := os.Stat(filepath.Join(procDir, proc.CrashedFileName)); os.IsNotExist(err) {
+		t.Errorf("expected crashed marker file to exist")
+	}
+	if _, err := os.Stat(filepath.Join(procDir, proc.ExitCodeFileName)); !os.IsNotExist(err) {
+		t.Errorf("expected exit_code file to not exist for observed crash")
 	}
 }
 
@@ -429,11 +435,21 @@ func TestSkill_FileContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read skill file %s: %v", skillPath, err)
 	}
-	if !strings.Contains(string(content), "name: wackyproc") {
+	skillStr := string(content)
+	if !strings.Contains(skillStr, "name: wackyproc") {
 		t.Errorf("expected skill to contain 'name: wackyproc'")
 	}
-	if !strings.Contains(string(content), "# WackyProc Process Management & Long-Running Command Guide") {
+	if !strings.Contains(skillStr, "# WackyProc Process Management & Long-Running Command Guide") {
 		t.Errorf("expected skill to contain guide title")
+	}
+	if !strings.Contains(skillStr, "wackyproc wait --for") {
+		t.Errorf("expected skill to document 'wackyproc wait --for'")
+	}
+	if !strings.Contains(skillStr, "invisible to any-mode") {
+		t.Errorf("expected skill to document terminal-at-entry invisibility contract")
+	}
+	if strings.Contains(skillStr, "(recorded as 137)") {
+		t.Errorf("expected skill to drop obsolete '(recorded as 137)'")
 	}
 }
 
@@ -1169,13 +1185,15 @@ func seedProcessRecord(t *testing.T, cwd string, id string, tool string, status 
 	}
 
 	if status != proc.StatusRunning {
-		exitCode := 0
-		if status == proc.StatusFailed {
-			exitCode = 1
-		} else if status == proc.StatusCrashed {
-			exitCode = proc.CrashedExitCode
+		if status == proc.StatusCrashed {
+			_ = os.WriteFile(filepath.Join(procDir, proc.CrashedFileName), []byte(""), 0644)
+		} else {
+			exitCode := 0
+			if status == proc.StatusFailed {
+				exitCode = 1
+			}
+			_ = os.WriteFile(filepath.Join(procDir, proc.ExitCodeFileName), []byte(fmt.Sprintf("%d\n", exitCode)), 0644)
 		}
-		_ = os.WriteFile(filepath.Join(procDir, proc.ExitCodeFileName), []byte(fmt.Sprintf("%d\n", exitCode)), 0644)
 	} else {
 		// Running process: point PID to current process so kill -0 returns 0 (running)
 		pid := os.Getpid()
@@ -1608,5 +1626,161 @@ func TestGet_MissingIndividualFiles(t *testing.T) {
 		if !strings.Contains(err.Error(), expectedMsg) {
 			t.Errorf("expected %q error, got: %v", expectedMsg, err)
 		}
+	}
+}
+
+func TestCrashMarker_Lifecycle(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	// 1. Crash observed -> marker written, CRASHED reported on every subsequent list/wait
+	procID := "crsh"
+	procDir := filepath.Join(cwd, proc.ProcDirName, procID)
+	if err := os.MkdirAll(procDir, 0755); err != nil {
+		t.Fatalf("failed to create procDir: %v", err)
+	}
+
+	deadPID := 999999
+	_ = os.WriteFile(filepath.Join(procDir, proc.PIDFileName), []byte(fmt.Sprintf("%d\n", deadPID)), 0644)
+	meta := proc.Meta{
+		ID:        procID,
+		Tool:      "crashed-tool",
+		StartedAt: time.Now().Unix(),
+	}
+	metaData, _ := json.Marshal(meta)
+	_ = os.WriteFile(filepath.Join(procDir, proc.MetaFileName), metaData, 0644)
+
+	// Initial check: should observe crash, write marker, and return CRASHED with nil exitCode
+	status, _, _, exitCode, err := proc.CheckLiveness(procDir, &meta)
+	if err != nil {
+		t.Fatalf("CheckLiveness failed: %v", err)
+	}
+	if status != proc.StatusCrashed {
+		t.Errorf("expected status %s, got %s", proc.StatusCrashed, status)
+	}
+	if exitCode != nil {
+		t.Errorf("expected exitCode nil, got %v", exitCode)
+	}
+
+	// Verify marker exists on disk and exit_code file was NOT written
+	crashedPath := filepath.Join(procDir, proc.CrashedFileName)
+	if _, err := os.Stat(crashedPath); os.IsNotExist(err) {
+		t.Errorf("expected crashed marker file %s to exist", crashedPath)
+	}
+	exitCodePath := filepath.Join(procDir, proc.ExitCodeFileName)
+	if _, err := os.Stat(exitCodePath); !os.IsNotExist(err) {
+		t.Errorf("expected exit_code file to not exist for observed crash")
+	}
+
+	// Subsequent list: CRASHED reported
+	list, err := proc.List(cwd)
+	if err != nil {
+		t.Fatalf("proc.List failed: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 process in list, got %d", len(list))
+	}
+	if list[0].Status != proc.StatusCrashed {
+		t.Errorf("expected list status %s, got %s", proc.StatusCrashed, list[0].Status)
+	}
+	if list[0].ExitCode != nil {
+		t.Errorf("expected list exitCode nil, got %v", list[0].ExitCode)
+	}
+
+	// Subsequent wait: CRASHED reported immediately
+	waitedID, err := proc.Wait(cwd, 5, procID)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if waitedID != procID {
+		t.Errorf("expected wait to return %s, got %s", procID, waitedID)
+	}
+
+	// 2. Marker survives process record restarts (fresh check from on-disk state)
+	var reloadedMeta proc.Meta
+	metaBytes, err := os.ReadFile(filepath.Join(procDir, proc.MetaFileName))
+	if err != nil {
+		t.Fatalf("failed to read meta: %v", err)
+	}
+	if err := json.Unmarshal(metaBytes, &reloadedMeta); err != nil {
+		t.Fatalf("failed to unmarshal meta: %v", err)
+	}
+
+	recheckStatus, _, _, recheckExitCode, err := proc.CheckLiveness(procDir, &reloadedMeta)
+	if err != nil {
+		t.Fatalf("CheckLiveness failed on re-check: %v", err)
+	}
+	if recheckStatus != proc.StatusCrashed {
+		t.Errorf("expected recheckStatus %s after restart, got %s", proc.StatusCrashed, recheckStatus)
+	}
+	if recheckExitCode != nil {
+		t.Errorf("expected recheckExitCode nil after restart, got %v", recheckExitCode)
+	}
+
+	// And verify list reloads and sees CRASHED
+	recheckList, err := proc.List(cwd)
+	if err != nil {
+		t.Fatalf("proc.List failed: %v", err)
+	}
+	var foundCrashed bool
+	for _, p := range recheckList {
+		if p.ID == procID {
+			foundCrashed = true
+			if p.Status != proc.StatusCrashed {
+				t.Errorf("expected List status %s for restarted record, got %s", proc.StatusCrashed, p.Status)
+			}
+			if p.ExitCode != nil {
+				t.Errorf("expected List exitCode nil for restarted record, got %v", p.ExitCode)
+			}
+		}
+	}
+	if !foundCrashed {
+		t.Errorf("expected to find %s in list", procID)
+	}
+
+	// 3. Honest SIGKILL exit (137 without marker) -> FAILED
+	sigkillID := "skil"
+	sigkillDir := filepath.Join(cwd, proc.ProcDirName, sigkillID)
+	if err := os.MkdirAll(sigkillDir, 0755); err != nil {
+		t.Fatalf("failed to create sigkillDir: %v", err)
+	}
+	_ = os.WriteFile(filepath.Join(sigkillDir, proc.PIDFileName), []byte(fmt.Sprintf("%d\n", deadPID)), 0644)
+	_ = os.WriteFile(filepath.Join(sigkillDir, proc.ExitCodeFileName), []byte("137\n"), 0644)
+	sigkillMeta := proc.Meta{
+		ID:        sigkillID,
+		Tool:      "killed-tool",
+		StartedAt: time.Now().Unix(),
+	}
+	sigkillMetaData, _ := json.Marshal(sigkillMeta)
+	_ = os.WriteFile(filepath.Join(sigkillDir, proc.MetaFileName), sigkillMetaData, 0644)
+
+	skStatus, _, _, skExitCode, err := proc.CheckLiveness(sigkillDir, &sigkillMeta)
+	if err != nil {
+		t.Fatalf("CheckLiveness for SIGKILL failed: %v", err)
+	}
+	if skStatus != proc.StatusFailed {
+		t.Errorf("expected status %s for 137 without marker, got %s", proc.StatusFailed, skStatus)
+	}
+	if skExitCode == nil || *skExitCode != 137 {
+		t.Errorf("expected exit code 137, got %v", skExitCode)
+	}
+
+	skList, err := proc.List(cwd)
+	if err != nil {
+		t.Fatalf("proc.List failed: %v", err)
+	}
+	var foundSIGKILL bool
+	for _, p := range skList {
+		if p.ID == sigkillID {
+			foundSIGKILL = true
+			if p.Status != proc.StatusFailed {
+				t.Errorf("expected List status %s for 137 without marker, got %s", proc.StatusFailed, p.Status)
+			}
+			if p.ExitCode == nil || *p.ExitCode != 137 {
+				t.Errorf("expected List exit code 137, got %v", p.ExitCode)
+			}
+		}
+	}
+	if !foundSIGKILL {
+		t.Errorf("expected to find %s in list", sigkillID)
 	}
 }

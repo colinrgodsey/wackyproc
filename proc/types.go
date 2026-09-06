@@ -1,20 +1,22 @@
 package proc
 
 const (
-	ProcDirName               = ".proc"
-	ToolsDirName              = "tools"
-	MetaFileName              = "meta.json"
-	PIDFileName               = "pid"
-	SupervisorPIDFileName     = "supervisor_pid"
-	PGIDFileName              = "pgid"
-	ExitCodeFileName          = "exit_code"
-	StdinFileName             = "stdin"
-	StdoutFileName            = "stdout"
-	StderrFileName            = "stderr"
-	StatusRunning             = "RUNNING"
-	StatusCompleted           = "COMPLETED"
-	StatusFailed              = "FAILED"
-	StatusCrashed             = "CRASHED"
+	ProcDirName           = ".proc"
+	ToolsDirName          = "tools"
+	MetaFileName          = "meta.json"
+	PIDFileName           = "pid"
+	SupervisorPIDFileName = "supervisor_pid"
+	PGIDFileName          = "pgid"
+	ExitCodeFileName      = "exit_code"
+	CrashedFileName       = "crashed"
+	StdinFileName         = "stdin"
+	StdoutFileName        = "stdout"
+	StderrFileName        = "stderr"
+	StatusRunning         = "RUNNING"
+	StatusCompleted       = "COMPLETED"
+	StatusFailed          = "FAILED"
+	StatusCrashed         = "CRASHED"
+	// Deprecated: Crashed state is persisted via CrashedFileName instead of CrashedExitCode.
 	CrashedExitCode           = 137
 	DefaultWaitPollIntervalMs = 50
 	StopGracePeriodMs         = 3000

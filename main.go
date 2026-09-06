@@ -3,14 +3,22 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"text/tabwriter"
 
 	"github.com/colinrgodsey/wackyproc/proc"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+)
+
+var (
+	negIntTokenPattern  = regexp.MustCompile(`^-\d+$`)
+	flagErrTokenPattern = regexp.MustCompile(`(?:in |unknown flag: )(--?\S+)`)
 )
 
 //go:embed skills/wackyproc/SKILL.md
@@ -124,6 +132,8 @@ var waitCmd = &cobra.Command{
 	Long: `Blocks up to the specified timeout (in seconds) waiting for a tracked
 background process to finish (COMPLETED, FAILED, or CRASHED).
 
+Timeout must be a non-negative integer. Sub-second requests (such as 0) poll for ~1s.
+
 In any-mode (default), waits for any process that was still running when the
 call began to reach a terminal state, ignoring processes already terminal at entry.
 If --for <id> is specified, waits for that specific process to complete (even if
@@ -132,7 +142,17 @@ already terminal at entry).
 Returns the process ID of the completed process and exits 0.
 If the timeout expires before a process finishes, exits non-zero.`,
 	SilenceUsage: true,
-	Args:         cobra.MaximumNArgs(1),
+	Args: func(cmd *cobra.Command, args []string) error {
+		if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
+			return err
+		}
+		if len(args) == 1 {
+			if n, err := strconv.Atoi(args[0]); err == nil && n < 0 {
+				return fmt.Errorf("wait: timeout must be a non-negative integer (got %s)", args[0])
+			}
+		}
+		return nil
+	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -145,6 +165,9 @@ If the timeout expires before a process finishes, exits non-zero.`,
 			timeoutSeconds, err = strconv.Atoi(args[0])
 			if err != nil {
 				return fmt.Errorf("invalid timeout seconds %q: %w", args[0], err)
+			}
+			if timeoutSeconds < 0 {
+				return fmt.Errorf("wait: timeout must be a non-negative integer (got %s)", args[0])
 			}
 		}
 
@@ -282,6 +305,20 @@ func init() {
 	stopCmd.Flags().IntVar(&stopTimeout, "timeout", 3, "Seconds to wait after SIGTERM before sending SIGKILL")
 	waitCmd.Flags().StringVar(&waitFor, "for", "", "Wait for a specific process ID to reach a terminal state")
 	peekCmd.Flags().IntVar(&peekLines, "lines", 20, "Number of trailing lines of stdout and stderr to show")
+
+	waitCmd.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
+		var token string
+		var notExistErr *pflag.NotExistError
+		if errors.As(err, &notExistErr) && notExistErr.GetSpecifiedShortnames() != "" {
+			token = "-" + notExistErr.GetSpecifiedShortnames()
+		} else if m := flagErrTokenPattern.FindStringSubmatch(err.Error()); len(m) > 1 {
+			token = m[1]
+		}
+		if token != "" && negIntTokenPattern.MatchString(token) {
+			return fmt.Errorf("wait: timeout must be a non-negative integer (got %s)", token)
+		}
+		return err
+	})
 
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(listCmd)
