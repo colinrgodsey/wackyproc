@@ -89,6 +89,13 @@ wackyproc stop a1b2
 # Or specify a custom timeout (in seconds) before SIGKILL:
 wackyproc stop a1b2 --timeout 5
 ```
+Force-kill the process group immediately when `stop` is too gentle (wedged
+process, hung model turn) or send an arbitrary signal by name or number:
+```bash
+wackyproc kill a1b2
+wackyproc signal a1b2 USR1
+wackyproc signal a1b2 15
+```
 
 ### 7. Clean Up & Manage Process Records
 `wackyproc run` automatically disposes the oldest consumed terminal records when terminal records exceed the cap (100). Unconsumed terminal records are never auto-disposed.
@@ -101,6 +108,45 @@ wackyproc stop a1b2 --timeout 5
   ```bash
   wackyproc unconsume a1b2
   ```
+
+---
+
+## Choosing between `wait` / `peek` / `list` / background-it
+
+A long-running background process gives you four ways to follow it up, and
+they are not interchangeable: `wait` blocks the turn, `peek` reads trailing
+output without blocking, `list --json` is a cheap status snapshot, and
+backgrounding just returns control and checks again next turn. Which one is
+right depends on whether blocking is authorized, not on which is fastest.
+
+**`wait` is a vetter's choice, not the agent's.** Before calling `wait`, you
+must have either (a) explicit user/process consent to block the current turn
+for N seconds, or (b) an autonomous loop where the user or parent process
+has pre-authorized blocking. Without that consent, pick a non-blocking
+alternative (`peek`, `list --json`) or return control and resume next turn.
+
+**Default when unsure: ask.** If you cannot tell whether blocking is
+appropriate, surface the choice to the user or parent process (for example
+as a clarifying question) rather than guessing. A wrong guess either wedges
+your own turn on a `wait 300` or makes the user wait for a status check they
+did not ask for.
+
+**Worked examples:**
+
+- *"Run the build and let me know when it's done"* - the user is elsewhere.
+  Background the build, then check `list --json` or `get` on a later turn
+  and report completion; do **not** call `wait`.
+- *"Run the build, I am waiting"* - the user is explicitly waiting.
+  `wait N` is correct, with N chosen against the user's perceived tolerance.
+- *Autonomous recovery loop* (for example retry-storm detection) - blocking
+  is pre-authorized by the loop's design; `wait` is correct.
+- *Progress visibility without blocking* - `peek` (trailing output) or
+  `list --json` (status and exit codes). Neither consumes the record, and
+  neither holds the turn.
+
+**Operational rule of thumb:** any `wait` longer than ~30 seconds is a
+parent-process decision - do not take it unilaterally. Short waits (<10s)
+are usually fine to take without asking.
 
 ---
 
