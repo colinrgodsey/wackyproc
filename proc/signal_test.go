@@ -50,3 +50,41 @@ func TestParseSignal(t *testing.T) {
 		})
 	}
 }
+
+func TestSignalTarget(t *testing.T) {
+	cases := []struct {
+		name    string
+		pid     int
+		pgid    int
+		want    int
+		wantErr bool
+	}{
+		{name: "real process group uses -pgid", pid: 4242, pgid: 4242, want: -4242},
+		{name: "group differs from pid uses -pgid", pid: 100, pgid: 200, want: -200},
+		// agy's defensive-bug case: pid == 1 with no group must target the process directly,
+		// never -1 (which syscall.Kill treats as a broadcast to every reachable process).
+		{name: "pid 1 with no pgid targets pid directly", pid: 1, pgid: 0, want: 1},
+		{name: "no pgid falls back to direct pid", pid: 4242, pgid: 0, want: 4242},
+		{name: "no pgid falls back negative pgid", pid: 4242, pgid: -5, want: 4242},
+		{name: "pid 0 invalid", pid: 0, pgid: 0, wantErr: true},
+		{name: "negative pid invalid", pid: -3, pgid: 0, wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := signalTarget(c.pid, c.pgid)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("signalTarget(%d, %d) = %d, want error", c.pid, c.pgid, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("signalTarget(%d, %d) error: %v", c.pid, c.pgid, err)
+			}
+			if got != c.want {
+				t.Fatalf("signalTarget(%d, %d) = %d, want %d", c.pid, c.pgid, got, c.want)
+			}
+		})
+	}
+}

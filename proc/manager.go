@@ -686,15 +686,28 @@ func Signal(cwd string, procID string, sig syscall.Signal) error {
 		return nil // Already terminated
 	}
 
-	target := -pgid
-	if pgid <= 0 {
-		target = -pid
-		if pid <= 0 {
-			return fmt.Errorf("invalid PID/PGID for process %q", procID)
-		}
+	target, err := signalTarget(pid, pgid)
+	if err != nil {
+		return fmt.Errorf("invalid PID/PGID for process %q: %w", procID, err)
 	}
 
 	return syscall.Kill(target, sig)
+}
+
+// signalTarget picks the syscall.Kill target for a process record: the process group
+// (-pgid) when we have a real group, else the process itself. Deliberately never -pid:
+// with pid == 1 (container init or a supervisor masquerading as it), kill(-1, sig) would
+// broadcast to every process the caller can reach. Stop's identical fallback predates
+// this and is left untouched as a known follow-up.
+func signalTarget(pid, pgid int) (int, error) {
+	target := -pgid
+	if pgid <= 0 {
+		target = pid
+		if pid <= 0 {
+			return 0, fmt.Errorf("pid %d <= 0", pid)
+		}
+	}
+	return target, nil
 }
 
 // Kill force-terminates the process group associated with procID with SIGKILL immediately.
