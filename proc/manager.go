@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -621,6 +622,99 @@ func Stop(cwd string, procID string, timeoutSeconds int) error {
 	time.Sleep(50 * time.Millisecond)
 	_, _, _, _, _ = CheckLiveness(procDir, &meta)
 	return nil
+}
+
+// signalByName returns the signal for a name with SIG- prefix and case normalization
+// removed ("KILL", "kill", "SIGKILL", "9" all map to SIGKILL).
+var signalByName = map[string]syscall.Signal{
+	"HUP":   syscall.SIGHUP,
+	"INT":   syscall.SIGINT,
+	"QUIT":  syscall.SIGQUIT,
+	"KILL":  syscall.SIGKILL,
+	"TERM":  syscall.SIGTERM,
+	"USR1":  syscall.SIGUSR1,
+	"USR2":  syscall.SIGUSR2,
+	"CONT":  syscall.SIGCONT,
+	"STOP":  syscall.SIGSTOP,
+	"WINCH": syscall.SIGWINCH,
+}
+
+// ParseSignal resolves a user-supplied signal token - numeric or named, case-insensitive,
+// SIG- prefix optional - into a syscall.Signal. Unknown names and unknown numbers return
+// an error naming the offending token so the caller can report it without silently
+// falling back to any default.
+func ParseSignal(token string) (syscall.Signal, error) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return 0, fmt.Errorf("signal is required")
+	}
+	if n, err := strconv.Atoi(token); err == nil {
+		// Bound numeric tokens to the portable signal range (1..64 on Linux) so nonsense
+		// numbers like 999 fail loudly instead of becoming syscall.Signal(999).
+		if n >= 1 && n <= 64 {
+			return syscall.Signal(n), nil
+		}
+		return 0, fmt.Errorf("unknown signal number %q", token)
+	}
+	name := strings.ToUpper(token)
+	name = strings.TrimPrefix(name, "SIG")
+	if sig, ok := signalByName[name]; ok {
+		return sig, nil
+	}
+	return 0, fmt.Errorf("unknown signal %q", token)
+}
+
+// Signal sends the given signal to the process group associated with procID. Only RUNNING
+// processes are signaled; a terminal process is a clean no-op. The signal is dispatched to
+// the whole group (-pgid) mirroring Stop's target selection.
+func Signal(cwd string, procID string, sig syscall.Signal) error {
+	procDir := filepath.Join(cwd, ProcDirName, procID)
+	if _, err := os.Stat(procDir); os.IsNotExist(err) {
+		return fmt.Errorf("process %q not found", procID)
+	}
+
+	var meta Meta
+	if metaData, err := os.ReadFile(filepath.Join(procDir, MetaFileName)); err == nil {
+		_ = json.Unmarshal(metaData, &meta)
+	}
+
+	status, pid, pgid, _, err := CheckLiveness(procDir, &meta)
+	if err != nil {
+		return err
+	}
+	if status != StatusRunning {
+		return nil // Already terminated
+	}
+
+	target, err := signalTarget(pid, pgid)
+	if err != nil {
+		return fmt.Errorf("invalid PID/PGID for process %q: %w", procID, err)
+	}
+
+	return syscall.Kill(target, sig)
+}
+
+// signalTarget picks the syscall.Kill target for a process record: the process group
+// (-pgid) when we have a real group, else the process itself. Deliberately never -pid:
+// with pid == 1 (container init or a supervisor masquerading as it), kill(-1, sig) would
+// broadcast to every process the caller can reach. Stop's identical fallback predates
+// this and is left untouched as a known follow-up.
+func signalTarget(pid, pgid int) (int, error) {
+	target := -pgid
+	if pgid <= 0 {
+		target = pid
+		if pid <= 0 {
+			return 0, fmt.Errorf("pid %d <= 0", pid)
+		}
+	}
+	return target, nil
+}
+
+// Kill force-terminates the process group associated with procID with SIGKILL immediately.
+// Unlike Stop it never waits and never sends SIGTERM first; this is the operator's
+// force-kill for a wedged process that refuses graceful cleanup.
+func Kill(cwd string, procID string) error {
+	return Signal(cwd, procID, syscall.SIGKILL)
 }
 
 // Prune disposes ALL terminal (COMPLETED, FAILED, CRASHED) process records regardless of consumed state.
