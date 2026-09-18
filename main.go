@@ -249,6 +249,45 @@ followed by SIGKILL if the process group does not terminate within the timeout.`
 	},
 }
 
+var killCmd = &cobra.Command{
+	Use:   "kill <proc_id>",
+	Short: "SIGKILL a running background process group immediately",
+	Long: `Force-terminates the background process and its entire child process group with
+SIGKILL, immediately and without the graceful SIGTERM-then-wait that stop performs. This
+is the operator's response when a wedged process refuses to clean up (retry-storm, hung
+model turn) and stop is too gentle.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		return proc.Kill(cwd, args[0])
+	},
+}
+
+var signalCmd = &cobra.Command{
+	Use:   "signal <proc_id> <signal>",
+	Short: "Send an arbitrary signal to a running background process group",
+	Long: `Sends the given signal to the background process and its entire child process group.
+The signal is required and may be numeric or named, case-insensitive, with the SIG- prefix
+optional: 9, KILL, kill, and SIGKILL all mean the same thing. Supported names: HUP, INT,
+QUIT, KILL, TERM, USR1, USR2, CONT, STOP, WINCH, plus any numeric value. Unknown names or
+numbers are reported as errors, never silently defaulted.`,
+	Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		sig, err := proc.ParseSignal(args[1])
+		if err != nil {
+			return err
+		}
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		return proc.Signal(cwd, args[0], sig)
+	},
+}
+
 var pruneCmd = &cobra.Command{
 	Use:   "prune",
 	Short: "Dispose all terminal background process records",
@@ -326,6 +365,8 @@ func init() {
 	rootCmd.AddCommand(getCmd)
 	rootCmd.AddCommand(peekCmd)
 	rootCmd.AddCommand(stopCmd)
+	rootCmd.AddCommand(killCmd)
+	rootCmd.AddCommand(signalCmd)
 	rootCmd.AddCommand(pruneCmd)
 	rootCmd.AddCommand(unconsumeCmd)
 	rootCmd.AddCommand(skillCmd)
