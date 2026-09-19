@@ -593,12 +593,9 @@ func Stop(cwd string, procID string, timeoutSeconds int) error {
 		return nil // Already terminated
 	}
 
-	target := -pgid
-	if pgid <= 0 {
-		target = -pid
-		if pid <= 0 {
-			return fmt.Errorf("invalid PID/PGID for process %q", procID)
-		}
+	target, err := signalTarget(pid, pgid)
+	if err != nil {
+		return fmt.Errorf("invalid PID/PGID for process %q: %w", procID, err)
 	}
 
 	// Send SIGTERM to process group
@@ -697,8 +694,7 @@ func Signal(cwd string, procID string, sig syscall.Signal) error {
 // signalTarget picks the syscall.Kill target for a process record: the process group
 // (-pgid) when we have a real group, else the process itself. Deliberately never -pid:
 // with pid == 1 (container init or a supervisor masquerading as it), kill(-1, sig) would
-// broadcast to every process the caller can reach. Stop's identical fallback predates
-// this and is left untouched as a known follow-up.
+// broadcast to every process the caller can reach. Shared by Signal and Stop.
 func signalTarget(pid, pgid int) (int, error) {
 	target := -pgid
 	if pgid <= 0 {
