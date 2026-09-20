@@ -489,6 +489,11 @@ func clampWaitSeconds(requested int) int {
 	return requested
 }
 
+// ErrNothingToWaitFor is returned by any-mode Wait when there is no process eligible to
+// wait on at call time (nothing running, nothing unknown). The CLI treats it as a
+// successful no-op rather than a timeout.
+var ErrNothingToWaitFor = errors.New("nothing to wait for")
+
 // Wait blocks up to timeoutSeconds for a background process to reach a terminal state.
 // If targetID is provided, Wait blocks until that specific process reaches a terminal state;
 // baseline exclusion does not apply to a targeted wait.
@@ -525,10 +530,20 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		// Eligible = processes still running (or in any non-terminal state) at entry. If
+		// none exist there is nothing for an any-mode wait to observe: every record is
+		// already terminal, and a fresh process spawned after this call starts is not part
+		// of this wait's contract. Return immediately instead of burning the timeout.
+		anyEligible := false
 		for _, p := range initList {
 			if isTerminal(p.Status) {
 				baselineTerminal[p.ID] = true
+			} else {
+				anyEligible = true
 			}
+		}
+		if !anyEligible {
+			return "", ErrNothingToWaitFor
 		}
 	}
 

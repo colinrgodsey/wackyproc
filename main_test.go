@@ -64,31 +64,69 @@ func TestWaitCmd_CLI_PositionalAsTimeout(t *testing.T) {
 	}
 	defer os.Chdir(origCwd)
 
-	// wackyproc wait 1 (1 second) with no tracked processes
-	// Should time out and fail with "timeout waiting for process"
-	var stdoutBuf, stderrBuf bytes.Buffer
-	rootCmd.SetOut(&stdoutBuf)
-	rootCmd.SetErr(&stderrBuf)
+	// wackyproc wait 1 (1 second) with no tracked processes: nothing is eligible, so
+	// the wait is a no-op and must return immediately with success (Colin 2026-09-20).
 	rootCmd.SetArgs([]string{"wait", "1"})
 
+	start := time.Now()
 	err = rootCmd.Execute()
-	if err == nil {
-		t.Fatal("expected error on timeout, got nil")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("expected nil error for no-op wait, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "timeout waiting for process") {
-		t.Errorf("expected 'timeout waiting for process' error, got %v", err)
-	}
-
-	// The SilenceUsage contract is a claim about what is printed, so assert on the
-	// capture rather than on the struct field that produces it.
-	if strings.Contains(stderrBuf.String(), "Usage:") {
-		t.Errorf("expected no usage block on timeout, got stderr:\n%s", stderrBuf.String())
-	}
-	if !strings.Contains(stderrBuf.String(), "timeout waiting for process") {
-		t.Errorf("expected the diagnostic on stderr, got:\n%s", stderrBuf.String())
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("expected immediate no-op wait, took %v", elapsed)
 	}
 }
 
+// TestWaitCmd_CLI_NothingEligible_ReturnsImmediately pins acceptance 1+2 at the CLI:
+// any-mode wait with zero running processes prints a no-op message and exits 0
+// (redirected: wackyproc wait times out on a waiting turn, so the no-op return is
+// the contract callers rely on), rather than blocking the full timeout.
+func TestWaitCmd_CLI_NothingEligible_ReturnsImmediately(t *testing.T) {
+	resetWaitFlags(t)
+
+	tmpDir := t.TempDir()
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	rootCmd.SetArgs([]string{"wait", "600"})
+
+	// The no-op message is written via fmt.Println to os.Stdout (same as the normal
+	// completed-ID print), so capture os.Stdout like TestWaitCmd_CLI_Success does.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = origStdout }()
+
+	start := time.Now()
+	err = rootCmd.Execute()
+	elapsed := time.Since(start)
+
+	w.Close()
+
+	var outBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, r)
+
+	if err != nil {
+		t.Fatalf("expected nil error for no-op wait, got %v", err)
+	}
+	if !strings.Contains(outBuf.String(), "nothing to wait for") {
+		t.Errorf("expected stdout to contain \"nothing to wait for\", got %q", outBuf.String())
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("expected immediate no-op wait, took %v", elapsed)
+	}
+}
 func TestWaitCmd_CLI_ForUnknownID_FailsImmediately(t *testing.T) {
 	resetWaitFlags(t)
 

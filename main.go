@@ -178,6 +178,10 @@ If the timeout expires before a process finishes, exits non-zero.`,
 
 		procID, err := proc.Wait(cwd, timeoutSeconds, targetID...)
 		if err != nil {
+			if errors.Is(err, proc.ErrNothingToWaitFor) {
+				fmt.Println("nothing to wait for")
+				return nil
+			}
 			return err
 		}
 

@@ -608,16 +608,28 @@ done
 	}
 }
 
-func TestWait_AnyMode_IgnoresAlreadyTerminalProcesses(t *testing.T) {
+// TestWait_AnyMode_NoEligible_ReturnsImmediately pins acceptance 1+2: an any-mode wait
+// with ZERO eligible (running-at-entry) processes returns immediately instead of
+// burning the timeout. Covers both the empty-store case and the only-terminal case.
+func TestWait_AnyMode_NoEligible_ReturnsImmediately(t *testing.T) {
 	cwd := setupTestEnv(t)
 
+	// Acceptance 1: zero processes at all.
+	start := time.Now()
+	_, err := proc.Wait(cwd, 600)
+	if err != proc.ErrNothingToWaitFor {
+		t.Fatalf("expected ErrNothingToWaitFor with zero processes, got %v", err)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Errorf("zero-process wait took %v, want immediate", time.Since(start))
+	}
+
+	// Acceptance 2: only terminal processes.
 	createExecutable(t, cwd, "fast-finish", `exit 0`)
-	id, err := proc.Run(cwd, "fast-finish", nil, nil)
+	_, err = proc.Run(cwd, "fast-finish", nil, nil)
 	if err != nil {
 		t.Fatalf("proc.Run failed: %v", err)
 	}
-
-	// Wait until fast-finish has fully terminated
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
@@ -627,38 +639,15 @@ func TestWait_AnyMode_IgnoresAlreadyTerminalProcesses(t *testing.T) {
 		}
 	}
 
-	type result struct {
-		id  string
-		err error
+	start = time.Now()
+	_, err = proc.Wait(cwd, 600)
+	if err != proc.ErrNothingToWaitFor {
+		t.Fatalf("expected ErrNothingToWaitFor with only-terminal processes, got %v", err)
 	}
-	resCh := make(chan result, 1)
-	go func() {
-		gotID, waitErr := proc.Wait(cwd, 1)
-		resCh <- result{id: gotID, err: waitErr}
-	}()
-
-	// Assert that Wait blocks and does not return the already-terminal process
-	select {
-	case res := <-resCh:
-		t.Fatalf("proc.Wait should have blocked and ignored already-terminal process %q, but returned immediately with id=%q, err=%v", id, res.id, res.err)
-	case <-time.After(50 * time.Millisecond):
-		// Expected: still blocked
-	}
-
-	// Assert completion after timeout (1 second clamped)
-	select {
-	case res := <-resCh:
-		if res.err != nil {
-			t.Fatalf("proc.Wait failed: %v", res.err)
-		}
-		if res.id != "" {
-			t.Fatalf("expected empty string on timeout, got %q (already-terminal process was incorrectly returned)", res.id)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for proc.Wait to complete")
+	if time.Since(start) > 100*time.Millisecond {
+		t.Errorf("only-terminal wait took %v, want immediate", time.Since(start))
 	}
 }
-
 func TestWait_AnyMode_ReturnsProcessTransitioningToTerminal(t *testing.T) {
 	cwd := setupTestEnv(t)
 
@@ -857,41 +846,26 @@ exit 0
 	}
 }
 
-func TestWait_NoTrackedProcesses_BlocksUntilTimeout(t *testing.T) {
+// TestWait_NoTrackedProcesses_ReturnsImmediately pins acceptance 1: an any-mode wait
+// with ZERO tracked processes has nothing eligible by definition, so it returns
+// immediately with ErrNothingToWaitFor instead of blocking the full timeout.
+func TestWait_NoTrackedProcesses_ReturnsImmediately(t *testing.T) {
 	cwd := setupTestEnv(t)
 
-	type result struct {
-		id  string
-		err error
-	}
-	resCh := make(chan result, 1)
-	go func() {
-		gotID, waitErr := proc.Wait(cwd, 1)
-		resCh <- result{id: gotID, err: waitErr}
-	}()
+	start := time.Now()
+	gotID, err := proc.Wait(cwd, 600)
+	elapsed := time.Since(start)
 
-	// Assert that Wait blocks instead of immediately erroring with "no tracked processes found"
-	select {
-	case res := <-resCh:
-		t.Fatalf("proc.Wait should have blocked, but returned immediately with id=%q, err=%v", res.id, res.err)
-	case <-time.After(50 * time.Millisecond):
-		// Expected: still blocked
+	if err != proc.ErrNothingToWaitFor {
+		t.Fatalf("expected ErrNothingToWaitFor with no tracked processes, got %v", err)
 	}
-
-	// Assert completion after timeout (1 second clamped) with nil error and empty ID
-	select {
-	case res := <-resCh:
-		if res.err != nil {
-			t.Fatalf("expected nil error on empty tracked processes, got: %v", res.err)
-		}
-		if res.id != "" {
-			t.Fatalf("expected empty string on timeout, got: %q", res.id)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for proc.Wait to complete")
+	if gotID != "" {
+		t.Fatalf("expected empty ID, got %q", gotID)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("expected immediate return, took %v", elapsed)
 	}
 }
-
 func TestPeek_UnknownProcID(t *testing.T) {
 	cwd := setupTestEnv(t)
 	var stdoutBuf, stderrBuf bytes.Buffer
