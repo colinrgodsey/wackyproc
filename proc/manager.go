@@ -17,40 +17,23 @@ import (
 
 // ResolveToolPath searches <cwd>/tools/ recursively for an executable matching toolName (matching D14 tool discovery).
 // Resolves directory and file symlinks and follows them, preventing infinite symlink cycles.
-// Rejects tool names attempting directory traversal outside tools/.
-// Returns the resolved path to the executable or an error if not found in tools/.
-func ResolveToolPath(cwd string, toolName string) (string, error) {
-	if toolName == "" {
-		return "", fmt.Errorf("tool name is required")
+// resolveDirectToolPath attempts to resolve toolName as a relative subpath under toolsDir.
+func resolveDirectToolPath(toolsDir, toolName string) (string, bool) {
+	if !strings.ContainsRune(toolName, '/') {
+		return "", false
 	}
-
-	toolsDir := filepath.Join(cwd, ToolsDirName)
-	if _, err := os.Stat(toolsDir); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("tool %q not found in %s/ (no PATH fallback)", toolName, ToolsDirName)
-		}
-		return "", fmt.Errorf("failed to access %s directory: %w", ToolsDirName, err)
-	}
-
-	// 1. Direct relative-path lookup in tools/ (e.g. tools/sub/mytool if
-	// toolName is "sub/mytool") - only for names that actually specify a
-	// subpath. A bare name (no separator) always falls through to the
-	// recursive walk below instead, so a same-named tool nested elsewhere
-	// in the tree can shadow it, matching wackypub's own D14 discovery
-	// (DiscoverAgentToolsMap) instead of silently preferring whatever
-	// happens to sit directly under tools/.
-	// Guard against path traversal outside tools/
-	if strings.ContainsRune(toolName, '/') {
-		cleanDirect := filepath.Clean(filepath.Join(toolsDir, toolName))
-		cleanToolsDir := filepath.Clean(toolsDir)
-		if strings.HasPrefix(cleanDirect, cleanToolsDir+string(filepath.Separator)) || cleanDirect == cleanToolsDir {
-			if info, err := os.Stat(cleanDirect); err == nil && info.Mode().IsRegular() && info.Mode()&0111 != 0 {
-				return cleanDirect, nil
-			}
+	cleanDirect := filepath.Clean(filepath.Join(toolsDir, toolName))
+	cleanToolsDir := filepath.Clean(toolsDir)
+	if strings.HasPrefix(cleanDirect, cleanToolsDir+string(filepath.Separator)) || cleanDirect == cleanToolsDir {
+		if info, err := os.Stat(cleanDirect); err == nil && info.Mode().IsRegular() && info.Mode()&0111 != 0 {
+			return cleanDirect, true
 		}
 	}
+	return "", false
+}
 
-	// 2. Recursive discovery under <cwd>/tools/ following directory symlinks with cycle detection (D14)
+// discoverToolsMap walks toolsDir recursively with symlink cycle detection to build the tool map.
+func discoverToolsMap(toolsDir string) (map[string]string, error) {
 	toolMap := make(map[string]string)
 	visitedDirs := make(map[string]bool)
 
@@ -95,7 +78,38 @@ func ResolveToolPath(cwd string, toolName string) (string, error) {
 	}
 
 	if err := walk(toolsDir); err != nil {
-		return "", fmt.Errorf("failed walking %s directory: %w", ToolsDirName, err)
+		return nil, fmt.Errorf("failed walking %s directory: %w", ToolsDirName, err)
+	}
+	return toolMap, nil
+}
+
+// ResolveToolPath resolves toolName to an executable path under <cwd>/tools/.
+// Traversal and recursive discovery match wackypub's D14 tool discovery rules.
+// Rejects tool names attempting directory traversal outside tools/.
+// Returns the resolved path to the executable or an error if not found in tools/.
+func ResolveToolPath(cwd string, toolName string) (string, error) {
+	if toolName == "" {
+		return "", fmt.Errorf("tool name is required")
+	}
+
+	toolsDir := filepath.Join(cwd, ToolsDirName)
+	if _, err := os.Stat(toolsDir); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("tool %q not found in %s/ (no PATH fallback)", toolName, ToolsDirName)
+		}
+		return "", fmt.Errorf("failed to access %s directory: %w", ToolsDirName, err)
+	}
+
+	// 1. Direct relative-path lookup in tools/ (e.g. tools/sub/mytool if
+	// toolName is "sub/mytool") - only for names that actually specify a subpath.
+	if directPath, ok := resolveDirectToolPath(toolsDir, toolName); ok {
+		return directPath, nil
+	}
+
+	// 2. Recursive discovery under <cwd>/tools/ following directory symlinks with cycle detection (D14)
+	toolMap, err := discoverToolsMap(toolsDir)
+	if err != nil {
+		return "", err
 	}
 
 	if resolved, ok := toolMap[toolName]; ok {
@@ -103,6 +117,86 @@ func ResolveToolPath(cwd string, toolName string) (string, error) {
 	}
 
 	return "", fmt.Errorf("tool %q not found in %s/ (no PATH fallback)", toolName, ToolsDirName)
+}
+
+// cleanupProcDir removes a process directory that failed to initialize. If removal
+// fails, it warns on stderr so leftover garbage in .proc/ is operator-visible,
+// but does not overwrite the primary initialization error that caused the abort.
+func cleanupProcDir(procDir string) {
+	if err := os.RemoveAll(procDir); err != nil {
+		// Best-effort cleanup: the primary initialization error is returned to the caller;
+		// log leftover directory to stderr so disk accumulation is diagnosable.
+		fmt.Fprintf(os.Stderr, "warning: failed to clean up aborted process directory %s: %v\n", procDir, err)
+	}
+}
+
+// prepareProcessRecord prepares the process directory, writes stdin if provided, allocates
+// a sequence generation number, and persists the initial meta.json.
+func prepareProcessRecord(cwd, procID, procDir, toolName, toolPath string, args []string, stdinReader io.Reader) error {
+	procBaseDir := filepath.Join(cwd, ProcDirName)
+
+	// Synchronously drain stdin into .proc/<id>/stdin if present
+	if stdinReader != nil {
+		stdinData, err := io.ReadAll(stdinReader)
+		if err == nil && len(stdinData) > 0 {
+			stdinPath := filepath.Join(procDir, StdinFileName)
+			if err := os.WriteFile(stdinPath, stdinData, 0644); err != nil {
+				cleanupProcDir(procDir)
+				return fmt.Errorf("failed to write %s: %w", StdinFileName, err)
+			}
+		}
+	}
+
+	// Allocate monotonic generation number and write initial meta.json
+	gen, err := nextSeq(procBaseDir)
+	if err != nil {
+		cleanupProcDir(procDir)
+		return fmt.Errorf("failed to allocate sequence generation: %w", err)
+	}
+
+	meta := Meta{
+		ID:        procID,
+		Tool:      toolName,
+		ToolPath:  toolPath,
+		Args:      args,
+		Cwd:       cwd,
+		StartedAt: time.Now().Unix(),
+		Gen:       gen,
+	}
+	metaBytes, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		cleanupProcDir(procDir)
+		return fmt.Errorf("failed to serialize %s: %w", MetaFileName, err)
+	}
+	if err := os.WriteFile(filepath.Join(procDir, MetaFileName), metaBytes, 0644); err != nil {
+		cleanupProcDir(procDir)
+		return fmt.Errorf("failed to write %s: %w", MetaFileName, err)
+	}
+	return nil
+}
+
+// launchSupervisor starts the detached supervisor process for procDir with Setsid: true.
+func launchSupervisor(cwd, procDir string) error {
+	selfBin, err := os.Executable()
+	if err != nil {
+		cleanupProcDir(procDir)
+		return fmt.Errorf("failed to resolve executable path: %w", err)
+	}
+
+	cmd := exec.Command(selfBin, "__supervise", procDir)
+	cmd.Dir = cwd
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true,
+	}
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	if err := cmd.Start(); err != nil {
+		cleanupProcDir(procDir)
+		return fmt.Errorf("failed to detach supervisor: %w", err)
+	}
+	return nil
 }
 
 // Run spawns a background process detached from the current session.
@@ -131,64 +225,14 @@ func Run(cwd string, toolName string, args []string, stdinReader io.Reader) (str
 		return "", err
 	}
 
-	// 3. Synchronously drain stdin into .proc/<id>/stdin if present
-	if stdinReader != nil {
-		stdinData, err := io.ReadAll(stdinReader)
-		if err == nil && len(stdinData) > 0 {
-			stdinPath := filepath.Join(procDir, StdinFileName)
-			if err := os.WriteFile(stdinPath, stdinData, 0644); err != nil {
-				_ = os.RemoveAll(procDir)
-				return "", fmt.Errorf("failed to write %s: %w", StdinFileName, err)
-			}
-		}
+	// 3. Prepare process directory, drain stdin, and write initial meta.json
+	if err := prepareProcessRecord(cwd, procID, procDir, toolName, toolPath, args, stdinReader); err != nil {
+		return "", err
 	}
 
-	// 4. Allocate monotonic generation number and write initial meta.json
-	gen, err := nextSeq(procBaseDir)
-	if err != nil {
-		_ = os.RemoveAll(procDir)
-		return "", fmt.Errorf("failed to allocate sequence generation: %w", err)
-	}
-
-	meta := Meta{
-		ID:        procID,
-		Tool:      toolName,
-		ToolPath:  toolPath,
-		Args:      args,
-		Cwd:       cwd,
-		StartedAt: time.Now().Unix(),
-		Gen:       gen,
-	}
-	metaBytes, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		_ = os.RemoveAll(procDir)
-		return "", fmt.Errorf("failed to serialize %s: %w", MetaFileName, err)
-	}
-	if err := os.WriteFile(filepath.Join(procDir, MetaFileName), metaBytes, 0644); err != nil {
-		_ = os.RemoveAll(procDir)
-		return "", fmt.Errorf("failed to write %s: %w", MetaFileName, err)
-	}
-
-	// 5. Resolve self binary path for supervisor fork
-	selfBin, err := os.Executable()
-	if err != nil {
-		_ = os.RemoveAll(procDir)
-		return "", fmt.Errorf("failed to resolve executable path: %w", err)
-	}
-
-	// 6. Launch detached supervisor with Setsid: true
-	cmd := exec.Command(selfBin, "__supervise", procDir)
-	cmd.Dir = cwd
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setsid: true,
-	}
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-
-	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(procDir)
-		return "", fmt.Errorf("failed to detach supervisor: %w", err)
+	// 4. Launch detached supervisor with Setsid: true
+	if err := launchSupervisor(cwd, procDir); err != nil {
+		return "", err
 	}
 
 	// Post-spawn disposal of consumed terminal records exceeding cap (D79)
@@ -403,6 +447,8 @@ func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writ
 			return nil
 		}
 		if err := os.Rename(tmpPath, metaPath); err != nil {
+			// Best-effort cleanup: remove temporary meta file after rename failure to prevent tmp accumulation;
+			// failure to remove is secondary to the logged rename error.
 			_ = os.Remove(tmpPath)
 			fmt.Fprintf(os.Stderr, "warning: failed to rename %s for process %q: %v\n", MetaFileName, procID, err)
 			return nil
@@ -494,6 +540,67 @@ func clampWaitSeconds(requested int) int {
 // successful no-op rather than a timeout.
 var ErrNothingToWaitFor = errors.New("nothing to wait for")
 
+// buildBaselineTerminal records all processes that are already in a terminal state
+// when an untargeted Wait begins, so they can be excluded from satisfying the wait.
+// If no running processes are eligible to wait on, it returns ErrNothingToWaitFor.
+func buildBaselineTerminal(cwd string) (map[string]bool, error) {
+	baselineTerminal := make(map[string]bool)
+	initList, err := List(cwd)
+	if err != nil {
+		return nil, err
+	}
+	// Eligible = processes still running (or in any non-terminal state) at entry. If
+	// none exist there is nothing for an any-mode wait to observe: every record is
+	// already terminal, and a fresh process spawned after this call starts is not part
+	// of this wait's contract. Return immediately instead of burning the timeout.
+	anyEligible := false
+	for _, p := range initList {
+		if isTerminal(p.Status) {
+			baselineTerminal[p.ID] = true
+		} else {
+			anyEligible = true
+		}
+	}
+	if !anyEligible {
+		return nil, ErrNothingToWaitFor
+	}
+	return baselineTerminal, nil
+}
+
+// findTerminalProcess checks a process listing for completion against the target or baseline.
+func findTerminalProcess(cwd string, list []ProcessInfo, hasTarget bool, target string, baselineTerminal map[string]bool) (string, bool, error) {
+	if hasTarget {
+		var found *ProcessInfo
+		for i := range list {
+			if list[i].ID == target {
+				found = &list[i]
+				break
+			}
+		}
+		if found == nil {
+			procDir := filepath.Join(cwd, ProcDirName, target)
+			if _, err := os.Stat(procDir); os.IsNotExist(err) {
+				return "", false, fmt.Errorf("process %q not found", target)
+			}
+			return "", false, nil
+		}
+		if isTerminal(found.Status) {
+			return found.ID, true, nil
+		}
+		return "", false, nil
+	}
+
+	for _, p := range list {
+		if isTerminal(p.Status) {
+			if baselineTerminal[p.ID] {
+				continue
+			}
+			return p.ID, true, nil
+		}
+	}
+	return "", false, nil
+}
+
 // Wait blocks up to timeoutSeconds for a background process to reach a terminal state.
 // If targetID is provided, Wait blocks until that specific process reaches a terminal state;
 // baseline exclusion does not apply to a targeted wait.
@@ -525,25 +632,10 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 
 	var baselineTerminal map[string]bool
 	if !hasTarget {
-		baselineTerminal = make(map[string]bool)
-		initList, err := List(cwd)
+		var err error
+		baselineTerminal, err = buildBaselineTerminal(cwd)
 		if err != nil {
 			return "", err
-		}
-		// Eligible = processes still running (or in any non-terminal state) at entry. If
-		// none exist there is nothing for an any-mode wait to observe: every record is
-		// already terminal, and a fresh process spawned after this call starts is not part
-		// of this wait's contract. Return immediately instead of burning the timeout.
-		anyEligible := false
-		for _, p := range initList {
-			if isTerminal(p.Status) {
-				baselineTerminal[p.ID] = true
-			} else {
-				anyEligible = true
-			}
-		}
-		if !anyEligible {
-			return "", ErrNothingToWaitFor
 		}
 	}
 
@@ -557,31 +649,10 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 			return "", err
 		}
 
-		if hasTarget {
-			var found *ProcessInfo
-			for i := range list {
-				if list[i].ID == target {
-					found = &list[i]
-					break
-				}
-			}
-			if found == nil {
-				procDir := filepath.Join(cwd, ProcDirName, target)
-				if _, err := os.Stat(procDir); os.IsNotExist(err) {
-					return "", fmt.Errorf("process %q not found", target)
-				}
-			} else if isTerminal(found.Status) {
-				return found.ID, nil
-			}
-		} else {
-			for _, p := range list {
-				if isTerminal(p.Status) {
-					if baselineTerminal[p.ID] {
-						continue
-					}
-					return p.ID, nil
-				}
-			}
+		if id, done, err := findTerminalProcess(cwd, list, hasTarget, target, baselineTerminal); err != nil {
+			return "", err
+		} else if done {
+			return id, nil
 		}
 
 		if time.Now().After(deadline) {
@@ -838,6 +909,8 @@ func Unconsume(cwd string, procID string) error {
 		return fmt.Errorf("failed to write temporary %s: %w", MetaFileName, err)
 	}
 	if err := os.Rename(tmpPath, metaPath); err != nil {
+		// Best-effort cleanup: remove temporary meta file after rename failure to prevent tmp accumulation;
+		// failure to remove does not supersede returning the rename error.
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("failed to update %s: %w", MetaFileName, err)
 	}

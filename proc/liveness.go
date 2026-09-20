@@ -79,9 +79,18 @@ func readRecordExitCode(procDir string) *int {
 	return &code
 }
 
-// statusFromTerminal derives COMPLETED or FAILED from a recorded exit code, and reports
+// statusFromMarkers checks if the crashed marker file exists, returning StatusCrashed
+// and any recorded exit code.
+func statusFromMarkers(procDir string) (string, *int, bool) {
+	if _, err := os.Stat(filepath.Join(procDir, CrashedFileName)); err == nil {
+		return StatusCrashed, readRecordExitCode(procDir), true
+	}
+	return "", nil, false
+}
+
+// statusFromExitCode derives COMPLETED or FAILED from a recorded exit code, and reports
 // whether a usable code was present at all.
-func statusFromTerminal(procDir string) (string, *int, bool) {
+func statusFromExitCode(procDir string) (string, *int, bool) {
 	code := readRecordExitCode(procDir)
 	if code == nil {
 		return "", nil, false
@@ -90,6 +99,32 @@ func statusFromTerminal(procDir string) (string, *int, bool) {
 		return StatusCompleted, code, true
 	}
 	return StatusFailed, code, true
+}
+
+func statusFromTerminal(procDir string) (string, *int, bool) {
+	return statusFromExitCode(procDir)
+}
+
+// isSupervisorFinalizing checks if supervisor is still alive and finalizing exit_code.
+func isSupervisorFinalizing(procDir string) bool {
+	if supPID := readRecordInt(procDir, SupervisorPIDFileName); supPID > 0 {
+		if supProc, supErr := os.FindProcess(supPID); supErr == nil && supProc.Signal(syscall.Signal(0)) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// pidRecycled checks whether a running process PID has a start time that differs
+// from the recorded start time, indicating the PID was recycled by the OS.
+func pidRecycled(pid int, meta *Meta) bool {
+	if meta != nil && meta.StartTime != "" {
+		currentStartTime := GetProcessStartTime(pid)
+		if currentStartTime != "" && currentStartTime != meta.StartTime {
+			return true
+		}
+	}
+	return false
 }
 
 // markCrashed writes the crashed marker. The returned status does not depend on this
@@ -106,17 +141,15 @@ func CheckLiveness(procDir string, meta *Meta) (Liveness, error) {
 		PGID: readRecordInt(procDir, PGIDFileName),
 	}
 
-	crashedPath := filepath.Join(procDir, CrashedFileName)
-
 	// 1. Check if crashed marker file exists
-	if _, err := os.Stat(crashedPath); err == nil {
-		lv.Status = StatusCrashed
-		lv.ExitCode = readRecordExitCode(procDir)
+	if status, code, ok := statusFromMarkers(procDir); ok {
+		lv.Status = status
+		lv.ExitCode = code
 		return lv, nil
 	}
 
 	// 2. Check if exit_code file exists
-	if status, code, ok := statusFromTerminal(procDir); ok {
+	if status, code, ok := statusFromExitCode(procDir); ok {
 		lv.Status = status
 		lv.ExitCode = code
 		return lv, nil
@@ -131,22 +164,18 @@ func CheckLiveness(procDir string, meta *Meta) (Liveness, error) {
 	// 3. Zero-signal liveness check (kill -0 <pid>)
 	process, err := os.FindProcess(lv.PID)
 	if err != nil || process.Signal(syscall.Signal(0)) != nil {
-		// If child process just terminated, check if supervisor is still alive and finalizing exit_code
-		if supPID := readRecordInt(procDir, SupervisorPIDFileName); supPID > 0 {
-			if supProc, supErr := os.FindProcess(supPID); supErr == nil && supProc.Signal(syscall.Signal(0)) == nil {
-				// Supervisor is alive and finalizing exit code
-				lv.Status = StatusRunning
-				return lv, nil
-			}
+		if isSupervisorFinalizing(procDir) {
+			lv.Status = StatusRunning
+			return lv, nil
 		}
 
 		// Re-check if crashed marker or exit_code was written in the interim
-		if _, err := os.Stat(crashedPath); err == nil {
-			lv.Status = StatusCrashed
-			lv.ExitCode = readRecordExitCode(procDir)
+		if status, code, ok := statusFromMarkers(procDir); ok {
+			lv.Status = status
+			lv.ExitCode = code
 			return lv, nil
 		}
-		if status, code, ok := statusFromTerminal(procDir); ok {
+		if status, code, ok := statusFromExitCode(procDir); ok {
 			lv.Status = status
 			lv.ExitCode = code
 			return lv, nil
@@ -159,14 +188,10 @@ func CheckLiveness(procDir string, meta *Meta) (Liveness, error) {
 	}
 
 	// 4. Start-time verification to detect PID reuse
-	if meta != nil && meta.StartTime != "" {
-		currentStartTime := GetProcessStartTime(lv.PID)
-		if currentStartTime != "" && currentStartTime != meta.StartTime {
-			// PID was recycled by another process!
-			markCrashed(procDir)
-			lv.Status = StatusCrashed
-			return lv, nil
-		}
+	if pidRecycled(lv.PID, meta) {
+		markCrashed(procDir)
+		lv.Status = StatusCrashed
+		return lv, nil
 	}
 
 	lv.Status = StatusRunning
