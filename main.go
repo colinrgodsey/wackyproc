@@ -341,7 +341,7 @@ var skillCmd = &cobra.Command{
 
 func init() {
 	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output process list as JSON")
-	stopCmd.Flags().IntVar(&stopTimeout, "timeout", 3, "Seconds to wait after SIGTERM before sending SIGKILL")
+	stopCmd.Flags().IntVar(&stopTimeout, "timeout", proc.DefaultStopTimeoutSeconds, "Seconds to wait after SIGTERM before sending SIGKILL")
 	waitCmd.Flags().StringVar(&waitFor, "for", "", "Wait for a specific process ID to reach a terminal state")
 	peekCmd.Flags().IntVar(&peekLines, "lines", 20, "Number of trailing lines of stdout and stderr to show")
 

@@ -41,98 +41,134 @@ func GetProcessStartTime(pid int) string {
 	return ""
 }
 
-// CheckLiveness determines the current status of a process in procDir.
-// Returns status (RUNNING, COMPLETED, FAILED, CRASHED), PID, PGID, exitCode.
-func CheckLiveness(procDir string, meta *Meta) (status string, pid int, pgid int, exitCode *int, err error) {
-	// Read PID and PGID if files exist
-	if pidBytes, err := os.ReadFile(filepath.Join(procDir, PIDFileName)); err == nil {
-		if val, err := strconv.Atoi(strings.TrimSpace(string(pidBytes))); err == nil {
-			pid = val
-		}
+// Liveness is the outcome of inspecting one process record. It replaced a five-value
+// return of two adjacent ints plus a nullable code, which call sites could only consume
+// by discarding positions they did not want.
+type Liveness struct {
+	Status string
+	PID    int
+	PGID   int
+	// ExitCode is non-nil only when a terminal status is backed by a recorded exit code.
+	ExitCode *int
+}
+
+// readRecordInt reads a single-integer process record file (pid, pgid).
+// An absent or malformed file yields 0, which callers treat as "not recorded yet".
+func readRecordInt(procDir, name string) int {
+	data, err := os.ReadFile(filepath.Join(procDir, name))
+	if err != nil {
+		return 0
 	}
-	if pgidBytes, err := os.ReadFile(filepath.Join(procDir, PGIDFileName)); err == nil {
-		if val, err := strconv.Atoi(strings.TrimSpace(string(pgidBytes))); err == nil {
-			pgid = val
-		}
+	val, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	return val
+}
+
+// readRecordExitCode returns the recorded exit code when exit_code holds a parseable integer.
+func readRecordExitCode(procDir string) *int {
+	data, err := os.ReadFile(filepath.Join(procDir, ExitCodeFileName))
+	if err != nil {
+		return nil
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil
+	}
+	return &code
+}
+
+// statusFromTerminal derives COMPLETED or FAILED from a recorded exit code, and reports
+// whether a usable code was present at all.
+func statusFromTerminal(procDir string) (string, *int, bool) {
+	code := readRecordExitCode(procDir)
+	if code == nil {
+		return "", nil, false
+	}
+	if *code == 0 {
+		return StatusCompleted, code, true
+	}
+	return StatusFailed, code, true
+}
+
+// markCrashed writes the crashed marker. The returned status does not depend on this
+// write: the marker only spares later readers the re-derivation, so a failure here is
+// reported by the caller's own status and never changes the answer.
+func markCrashed(procDir string) {
+	_ = os.WriteFile(filepath.Join(procDir, CrashedFileName), []byte(""), 0644)
+}
+
+// CheckLiveness determines the current status of a process in procDir.
+func CheckLiveness(procDir string, meta *Meta) (Liveness, error) {
+	lv := Liveness{
+		PID:  readRecordInt(procDir, PIDFileName),
+		PGID: readRecordInt(procDir, PGIDFileName),
 	}
 
 	crashedPath := filepath.Join(procDir, CrashedFileName)
-	exitCodePath := filepath.Join(procDir, ExitCodeFileName)
 
 	// 1. Check if crashed marker file exists
 	if _, err := os.Stat(crashedPath); err == nil {
-		if exitData, err := os.ReadFile(exitCodePath); err == nil {
-			if code, err := strconv.Atoi(strings.TrimSpace(string(exitData))); err == nil {
-				exitCode = &code
-			}
-		}
-		return StatusCrashed, pid, pgid, exitCode, nil
+		lv.Status = StatusCrashed
+		lv.ExitCode = readRecordExitCode(procDir)
+		return lv, nil
 	}
 
 	// 2. Check if exit_code file exists
-	if exitData, err := os.ReadFile(exitCodePath); err == nil {
-		code, err := strconv.Atoi(strings.TrimSpace(string(exitData)))
-		if err == nil {
-			exitCode = &code
-			if code == 0 {
-				return StatusCompleted, pid, pgid, exitCode, nil
-			}
-			return StatusFailed, pid, pgid, exitCode, nil
-		}
+	if status, code, ok := statusFromTerminal(procDir); ok {
+		lv.Status = status
+		lv.ExitCode = code
+		return lv, nil
 	}
 
 	// If no PID recorded yet (e.g. process just spawning)
-	if pid <= 0 {
-		return StatusRunning, pid, pgid, nil, nil
+	if lv.PID <= 0 {
+		lv.Status = StatusRunning
+		return lv, nil
 	}
 
 	// 3. Zero-signal liveness check (kill -0 <pid>)
-	process, err := os.FindProcess(pid)
+	process, err := os.FindProcess(lv.PID)
 	if err != nil || process.Signal(syscall.Signal(0)) != nil {
 		// If child process just terminated, check if supervisor is still alive and finalizing exit_code
-		if supData, supErr := os.ReadFile(filepath.Join(procDir, SupervisorPIDFileName)); supErr == nil {
-			if supPID, supErr := strconv.Atoi(strings.TrimSpace(string(supData))); supErr == nil && supPID > 0 {
-				if supProc, supErr := os.FindProcess(supPID); supErr == nil && supProc.Signal(syscall.Signal(0)) == nil {
-					// Supervisor is alive and finalizing exit code
-					return StatusRunning, pid, pgid, nil, nil
-				}
+		if supPID := readRecordInt(procDir, SupervisorPIDFileName); supPID > 0 {
+			if supProc, supErr := os.FindProcess(supPID); supErr == nil && supProc.Signal(syscall.Signal(0)) == nil {
+				// Supervisor is alive and finalizing exit code
+				lv.Status = StatusRunning
+				return lv, nil
 			}
 		}
 
 		// Re-check if crashed marker or exit_code was written in the interim
 		if _, err := os.Stat(crashedPath); err == nil {
-			if exitData, err := os.ReadFile(exitCodePath); err == nil {
-				if code, err := strconv.Atoi(strings.TrimSpace(string(exitData))); err == nil {
-					exitCode = &code
-				}
-			}
-			return StatusCrashed, pid, pgid, exitCode, nil
+			lv.Status = StatusCrashed
+			lv.ExitCode = readRecordExitCode(procDir)
+			return lv, nil
 		}
-		if exitData, err := os.ReadFile(exitCodePath); err == nil {
-			code, err := strconv.Atoi(strings.TrimSpace(string(exitData)))
-			if err == nil {
-				exitCode = &code
-				if code == 0 {
-					return StatusCompleted, pid, pgid, exitCode, nil
-				}
-				return StatusFailed, pid, pgid, exitCode, nil
-			}
+		if status, code, ok := statusFromTerminal(procDir); ok {
+			lv.Status = status
+			lv.ExitCode = code
+			return lv, nil
 		}
 
 		// Process and supervisor are both dead without writing exit_code
-		_ = os.WriteFile(crashedPath, []byte(""), 0644)
-		return StatusCrashed, pid, pgid, nil, nil
+		markCrashed(procDir)
+		lv.Status = StatusCrashed
+		return lv, nil
 	}
 
 	// 4. Start-time verification to detect PID reuse
 	if meta != nil && meta.StartTime != "" {
-		currentStartTime := GetProcessStartTime(pid)
+		currentStartTime := GetProcessStartTime(lv.PID)
 		if currentStartTime != "" && currentStartTime != meta.StartTime {
 			// PID was recycled by another process!
-			_ = os.WriteFile(crashedPath, []byte(""), 0644)
-			return StatusCrashed, pid, pgid, nil, nil
+			markCrashed(procDir)
+			lv.Status = StatusCrashed
+			return lv, nil
 		}
 	}
 
-	return StatusRunning, pid, pgid, nil, nil
+	lv.Status = StatusRunning
+	return lv, nil
 }

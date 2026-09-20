@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +37,23 @@ func TestSignalAndKillDeliverToProcessGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(procDir, PGIDFileName), []byte(strconv.Itoa(pgid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Signal and Stop refuse a record with no meta.json: without the recorded start time they
+	// cannot tell the tracked process from a recycled PID, so a hand-authored record has to
+	// carry one just like the real spawn path does.
+	metaData, err := json.Marshal(Meta{
+		ID:        "sigtest",
+		Tool:      "sh",
+		ToolPath:  "/bin/sh",
+		Cwd:       cwd,
+		StartedAt: time.Now().Unix(),
+		StartTime: GetProcessStartTime(cmd.Process.Pid),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(procDir, MetaFileName), metaData, 0o600); err != nil {
 		t.Fatal(err)
 	}
 

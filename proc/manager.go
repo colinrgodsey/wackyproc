@@ -2,6 +2,7 @@ package proc
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -223,17 +224,18 @@ func disposeConsumedTerminals(procBaseDir string) {
 			continue
 		}
 		procDir := filepath.Join(procBaseDir, entry.Name())
-		metaBytes, err := os.ReadFile(filepath.Join(procDir, MetaFileName))
+		// Enumeration tolerates an unreadable record: skipping it is what lets a corrupt
+		// record still be pruned later instead of failing the whole scan.
+		meta, err := readMeta(procDir)
 		if err != nil {
 			continue
 		}
-		var meta Meta
-		if err := json.Unmarshal(metaBytes, &meta); err != nil {
+
+		liveness, err := CheckLiveness(procDir, &meta)
+		if err != nil {
 			continue
 		}
-
-		status, _, _, _, _ := CheckLiveness(procDir, &meta)
-		if isTerminal(status) {
+		if isTerminal(liveness.Status) {
 			terminalCount++
 			if meta.ConsumedSeq > 0 {
 				consumedTerminals = append(consumedTerminals, consumedTerminalRecord{
@@ -289,17 +291,17 @@ func List(cwd string) ([]ProcessInfo, error) {
 		procID := entry.Name()
 		procDir := filepath.Join(procBaseDir, procID)
 
-		var meta Meta
-		if metaData, err := os.ReadFile(filepath.Join(procDir, MetaFileName)); err == nil {
-			_ = json.Unmarshal(metaData, &meta)
-		}
+		// List tolerates an unreadable meta.json and reports the record with whatever it
+		// has: hiding a directory that exists is worse than listing it with an empty tool
+		// name, and Prune has to stay able to clear it.
+		meta, _ := readMeta(procDir)
 
-		status, pid, pgid, exitCode, err := CheckLiveness(procDir, &meta)
+		liveness, err := CheckLiveness(procDir, &meta)
 		if err != nil {
 			continue
 		}
 
-		if isTerminal(status) {
+		if isTerminal(liveness.Status) {
 			terminalCount++
 			if meta.ConsumedSeq > 0 {
 				consumedTerminalCount++
@@ -315,10 +317,10 @@ func List(cwd string) ([]ProcessInfo, error) {
 			ID:        procID,
 			Tool:      toolName,
 			Args:      meta.Args,
-			Status:    status,
-			PID:       pid,
-			PGID:      pgid,
-			ExitCode:  exitCode,
+			Status:    liveness.Status,
+			PID:       liveness.PID,
+			PGID:      liveness.PGID,
+			ExitCode:  liveness.ExitCode,
 			StartedAt: meta.StartedAt,
 		})
 	}
@@ -377,8 +379,11 @@ func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writ
 		return nil
 	}
 
-	status, _, _, _, _ := CheckLiveness(procDir, &meta)
-	if isTerminal(status) && meta.ConsumedSeq == 0 {
+	liveness, err := CheckLiveness(procDir, &meta)
+	if err != nil {
+		return nil
+	}
+	if isTerminal(liveness.Status) && meta.ConsumedSeq == 0 {
 		seq, err := nextSeq(filepath.Join(cwd, ProcDirName))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to allocate consumed sequence for process %q: %v\n", procID, err)
@@ -572,52 +577,80 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 	}
 }
 
-// Stop terminates the process group associated with procID using SIGTERM, followed by SIGKILL if needed.
+// Stop timings. The grace period is exported because the CLI flag advertises it as its
+// default; the poll interval is the granularity of the terminal-state check.
+const (
+	DefaultStopTimeoutSeconds = 3
+	stopPollInterval          = 50 * time.Millisecond
+)
+
+// Stop terminates the process group associated with procID using SIGTERM, followed by
+// SIGKILL if needed. Every failure it cannot rule out is reported: an unreadable record, a
+// signal the kernel refused, and a process still running after SIGKILL.
 func Stop(cwd string, procID string, timeoutSeconds int) error {
 	procDir := filepath.Join(cwd, ProcDirName, procID)
 	if _, err := os.Stat(procDir); os.IsNotExist(err) {
 		return fmt.Errorf("process %q not found", procID)
 	}
 
-	var meta Meta
-	if metaData, err := os.ReadFile(filepath.Join(procDir, MetaFileName)); err == nil {
-		_ = json.Unmarshal(metaData, &meta)
+	// An unreadable meta.json is refused rather than replaced by a zero Meta: the zero value
+	// has no StartTime, which is precisely the state that skips the PID-recycling guard in
+	// CheckLiveness and then signals a group that may belong to another process.
+	meta, err := readMeta(procDir)
+	if err != nil {
+		return fmt.Errorf("cannot stop %q: %w", procID, err)
 	}
 
-	status, pid, pgid, _, err := CheckLiveness(procDir, &meta)
+	liveness, err := CheckLiveness(procDir, &meta)
 	if err != nil {
 		return err
 	}
-
-	if status != StatusRunning {
+	if liveness.Status != StatusRunning {
 		return nil // Already terminated
 	}
 
-	target, err := signalTarget(pid, pgid)
+	target, err := signalTarget(liveness.PID, liveness.PGID)
 	if err != nil {
 		return fmt.Errorf("invalid PID/PGID for process %q: %w", procID, err)
 	}
 
-	// Send SIGTERM to process group
-	_ = syscall.Kill(target, syscall.SIGTERM)
+	// Send SIGTERM to the process group. ESRCH means the target vanished between the liveness
+	// check and the signal, which is the outcome the caller asked for.
+	if err := syscall.Kill(target, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("failed to signal %d to stop process %q: %w", target, procID, err)
+	}
 
 	if timeoutSeconds <= 0 {
-		timeoutSeconds = 3
+		timeoutSeconds = DefaultStopTimeoutSeconds
 	}
 
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
 	for time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-		st, _, _, _, _ := CheckLiveness(procDir, &meta)
-		if st != StatusRunning {
+		time.Sleep(stopPollInterval)
+		liveness, err := CheckLiveness(procDir, &meta)
+		if err != nil {
+			return err
+		}
+		if liveness.Status != StatusRunning {
 			return nil
 		}
 	}
 
 	// Force kill with SIGKILL if still running
-	_ = syscall.Kill(target, syscall.SIGKILL)
-	time.Sleep(50 * time.Millisecond)
-	_, _, _, _, _ = CheckLiveness(procDir, &meta)
+	if err := syscall.Kill(target, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("failed to force kill %d for process %q: %w", target, procID, err)
+	}
+
+	// Verify rather than assume: a SIGKILL that was accepted but leaves the record RUNNING is
+	// a real problem (an unowned group, for instance) and must not be reported as stopped.
+	time.Sleep(stopPollInterval)
+	liveness, err = CheckLiveness(procDir, &meta)
+	if err != nil {
+		return err
+	}
+	if liveness.Status == StatusRunning {
+		return fmt.Errorf("process %q is still running after SIGKILL to %d", procID, target)
+	}
 	return nil
 }
 
@@ -670,20 +703,22 @@ func Signal(cwd string, procID string, sig syscall.Signal) error {
 		return fmt.Errorf("process %q not found", procID)
 	}
 
-	var meta Meta
-	if metaData, err := os.ReadFile(filepath.Join(procDir, MetaFileName)); err == nil {
-		_ = json.Unmarshal(metaData, &meta)
+	// Same rule as Stop: without a readable meta.json the anti-recycling signature is unknown,
+	// so the signal is refused instead of aimed at a possibly recycled group.
+	meta, err := readMeta(procDir)
+	if err != nil {
+		return fmt.Errorf("cannot signal %q: %w", procID, err)
 	}
 
-	status, pid, pgid, _, err := CheckLiveness(procDir, &meta)
+	liveness, err := CheckLiveness(procDir, &meta)
 	if err != nil {
 		return err
 	}
-	if status != StatusRunning {
+	if liveness.Status != StatusRunning {
 		return nil // Already terminated
 	}
 
-	target, err := signalTarget(pid, pgid)
+	target, err := signalTarget(liveness.PID, liveness.PGID)
 	if err != nil {
 		return fmt.Errorf("invalid PID/PGID for process %q: %w", procID, err)
 	}
@@ -733,18 +768,17 @@ func Prune(cwd string, report io.Writer) error {
 		procID := entry.Name()
 		procDir := filepath.Join(procBaseDir, procID)
 
-		var meta Meta
-		if metaBytes, err := os.ReadFile(filepath.Join(procDir, MetaFileName)); err == nil {
-			_ = json.Unmarshal(metaBytes, &meta)
-		}
+		// Prune tolerates an unreadable meta.json on purpose: meta only supplies the reported
+		// tool name, and refusing here would leave a corrupt record permanently undeletable.
+		meta, _ := readMeta(procDir)
 
 		toolName := meta.Tool
 		if toolName == "" {
 			toolName = procID
 		}
 
-		status, _, _, _, _ := CheckLiveness(procDir, &meta)
-		if isTerminal(status) {
+		liveness, _ := CheckLiveness(procDir, &meta)
+		if isTerminal(liveness.Status) {
 			if err := os.RemoveAll(procDir); err != nil {
 				return fmt.Errorf("failed to remove process record %s: %w", procID, err)
 			}

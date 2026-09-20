@@ -309,10 +309,11 @@ func TestPIDReuseDetection(t *testing.T) {
 
 	_ = os.WriteFile(filepath.Join(procDir, proc.PIDFileName), []byte(strconv.Itoa(currentPID)+"\n"), 0644)
 
-	status, _, _, exitCode, err := proc.CheckLiveness(procDir, &meta)
+	liveness, err := proc.CheckLiveness(procDir, &meta)
 	if err != nil {
 		t.Fatalf("CheckLiveness failed: %v", err)
 	}
+	status, exitCode := liveness.Status, liveness.ExitCode
 
 	// Should be marked CRASHED because the recorded start time doesn't match the current process start time
 	if status != proc.StatusCrashed || exitCode != nil {
@@ -1650,10 +1651,11 @@ func TestCrashMarker_Lifecycle(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(procDir, proc.MetaFileName), metaData, 0644)
 
 	// Initial check: should observe crash, write marker, and return CRASHED with nil exitCode
-	status, _, _, exitCode, err := proc.CheckLiveness(procDir, &meta)
+	liveness, err := proc.CheckLiveness(procDir, &meta)
 	if err != nil {
 		t.Fatalf("CheckLiveness failed: %v", err)
 	}
+	status, exitCode := liveness.Status, liveness.ExitCode
 	if status != proc.StatusCrashed {
 		t.Errorf("expected status %s, got %s", proc.StatusCrashed, status)
 	}
@@ -1705,10 +1707,11 @@ func TestCrashMarker_Lifecycle(t *testing.T) {
 		t.Fatalf("failed to unmarshal meta: %v", err)
 	}
 
-	recheckStatus, _, _, recheckExitCode, err := proc.CheckLiveness(procDir, &reloadedMeta)
+	recheckLiveness, err := proc.CheckLiveness(procDir, &reloadedMeta)
 	if err != nil {
 		t.Fatalf("CheckLiveness failed on re-check: %v", err)
 	}
+	recheckStatus, recheckExitCode := recheckLiveness.Status, recheckLiveness.ExitCode
 	if recheckStatus != proc.StatusCrashed {
 		t.Errorf("expected recheckStatus %s after restart, got %s", proc.StatusCrashed, recheckStatus)
 	}
@@ -1753,10 +1756,11 @@ func TestCrashMarker_Lifecycle(t *testing.T) {
 	sigkillMetaData, _ := json.Marshal(sigkillMeta)
 	_ = os.WriteFile(filepath.Join(sigkillDir, proc.MetaFileName), sigkillMetaData, 0644)
 
-	skStatus, _, _, skExitCode, err := proc.CheckLiveness(sigkillDir, &sigkillMeta)
+	skLiveness, err := proc.CheckLiveness(sigkillDir, &sigkillMeta)
 	if err != nil {
 		t.Fatalf("CheckLiveness for SIGKILL failed: %v", err)
 	}
+	skStatus, skExitCode := skLiveness.Status, skLiveness.ExitCode
 	if skStatus != proc.StatusFailed {
 		t.Errorf("expected status %s for 137 without marker, got %s", proc.StatusFailed, skStatus)
 	}

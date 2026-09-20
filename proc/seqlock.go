@@ -97,9 +97,14 @@ func nextSeq(procBaseDir string) (uint64, error) {
 	data, err := os.ReadFile(seqPath)
 	if err == nil {
 		parsed, parseErr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
-		if parseErr == nil {
-			current = parsed
+		if parseErr != nil {
+			// A present-but-unparseable .seq must not restart the counter at 0: Gen and
+			// ConsumedSeq are what distinguish a fresh record from a stale one, so resuming at
+			// zero makes already-consumed records look unconsumed. Fail loudly and leave the
+			// offending file in place for the operator to inspect.
+			return 0, fmt.Errorf("failed to parse %s in %s (found %q): refusing to restart the sequence at 0: %w", SeqFileName, procBaseDir, strings.TrimSpace(string(data)), parseErr)
 		}
+		current = parsed
 	} else if !os.IsNotExist(err) {
 		return 0, fmt.Errorf("failed to read %s: %w", SeqFileName, err)
 	}
