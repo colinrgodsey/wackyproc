@@ -36,6 +36,28 @@ Status is derived from liveness plus exit code, never stored:
 - `FAILED` — exited non-zero.
 - `CRASHED` — no exit code recorded but the process is gone (kill -9, OOM, abrupt host crash; exit 137 from SIGKILL also lands here). Start-time validation guards against PID reuse masquerading as liveness.
 
+## Supervised execution
+
+Every tool process spawned by `wackyproc run` inherits
+`WACKYPROC_SUPERVISED=<supervisor-pid>` - an attestation that the process is
+supervised by wackyproc (output captured, retrievable, not fire-and-forget),
+with the supervisor's pid doubling as provenance. Downstream tools (e.g.
+`wackypub agent prompt --async`) gate on its presence.
+
+To dispatch an async, supervised A2A call and later retrieve the output:
+
+```bash
+wackyproc run wackypub agent <target> prompt --async "...NO_RESPONSE..."
+wackyproc wait --for <proc_id>
+wackyproc get <proc_id>   # stdout holds the target's model output
+```
+
+There is no deadline machinery by design: a hung supervised process holds
+the same locks and has the same risk profile as a hung normal call, so the
+remedy is the existing kill signals - `wackyproc stop <id>` (SIGTERM, then
+SIGKILL after the grace period) or `wackyproc kill <id>` (immediate
+SIGKILL of the whole process group).
+
 ## Process-group isolation
 
 Stop, crash detection, and liveness all operate on the process *group*, not the PID: `stop` signals the group so grandchildren die with the child, and a record is only `RUNNING` while its group is alive. This is what makes `stop` reliable against multi-process trees (`npx → node → server`) that bare-PID management would orphan.

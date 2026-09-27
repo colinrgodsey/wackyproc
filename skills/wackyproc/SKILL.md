@@ -111,6 +111,40 @@ wackyproc signal a1b2 15
 
 ---
 
+## Supervised Execution & the WACKYPROC_SUPERVISED Attestation
+
+Every tool process spawned by `wackyproc run` carries
+`WACKYPROC_SUPERVISED=<supervisor-pid>` in its environment. The value is the
+pid of the supervising process - it doubles as provenance ("wackyproc spawned
+THIS process"). Downstream tools can gate on its presence to prove a call is
+supervised (output captured and retrievable, not fire-and-forget); for
+instance `wackypub agent prompt --async` refuses to run without it.
+
+The supervised async pattern for an agent-to-agent dispatch:
+
+```bash
+wackyproc run wackypub agent <target> prompt --async "...NO_RESPONSE..."
+```
+
+The caller gets back a 4-character process ID immediately, then polls with
+`wackyproc list` / `wackyproc wait --for <id>` and retrieves the target's
+model output from stdout with `wackyproc get <id>`. The NO_RESPONSE suffix is a
+token-saver convention, not a guarantee: a model that ignores it just
+produces normal output, which still lands in stdout where the caller can
+read it.
+
+**Hung processes are killed, not timed out.** There is deliberately no
+deadline machinery: a hung supervised call holds the same locks and presents
+the same risk profile as a hung normal call, so the remedy is identical -
+name the process group you want gone and signal it:
+
+```bash
+wackyproc stop <id>      # SIGTERM, falls back to SIGKILL after the grace period
+wackyproc kill <id>      # SIGKILL the whole process group immediately
+wackyproc signal <id> USR1  # any other signal, by name or number
+```
+
+
 ## Choosing between `wait` / `peek` / `list` / background-it
 
 A long-running background process gives you four ways to follow it up, and
