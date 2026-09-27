@@ -62,6 +62,11 @@ func Supervise(procDir string) error {
 	cmd := exec.Command(meta.ToolPath, meta.Args...)
 	cmd.Dir = meta.Cwd
 	cmd.Env = os.Environ()
+	// Attest that wackyproc supervised this process: the env var gates downstream
+	// supervised-only features (e.g. wackypub agent prompt --async), and its value is
+	// THIS supervisor's pid (os.Getpid() below equals the pid written to
+	// SupervisorPIDFileName above, so the two agree by construction).
+	cmd.Env = append(cmd.Env, SupervisedEnvVar+"="+strconv.Itoa(os.Getpid()))
 	cmd.Stdout = stdoutFile
 	cmd.Stderr = stderrFile
 	if stdinFile != nil {

@@ -6,16 +6,22 @@ const (
 	MetaFileName          = "meta.json"
 	PIDFileName           = "pid"
 	SupervisorPIDFileName = "supervisor_pid"
-	PGIDFileName          = "pgid"
-	ExitCodeFileName      = "exit_code"
-	CrashedFileName       = "crashed"
-	StdinFileName         = "stdin"
-	StdoutFileName        = "stdout"
-	StderrFileName        = "stderr"
-	StatusRunning         = "RUNNING"
-	StatusCompleted       = "COMPLETED"
-	StatusFailed          = "FAILED"
-	StatusCrashed         = "CRASHED"
+	// SupervisedEnvVar is set in the environment of every tool process spawned by
+	// wackyproc run. Its value is the supervising process's pid - it doubles as
+	// provenance ("wackyproc spawned THIS process"). Downstream tools (e.g. wackypub's
+	// agent prompt --async) gate on its presence to prove the dispatch is supervised
+	// and its output is captured/retrievable, not fire-and-forget.
+	SupervisedEnvVar = "WACKYPROC_SUPERVISED"
+	PGIDFileName     = "pgid"
+	ExitCodeFileName = "exit_code"
+	CrashedFileName  = "crashed"
+	StdinFileName    = "stdin"
+	StdoutFileName   = "stdout"
+	StderrFileName   = "stderr"
+	StatusRunning    = "RUNNING"
+	StatusCompleted  = "COMPLETED"
+	StatusFailed     = "FAILED"
+	StatusCrashed    = "CRASHED"
 	// Deprecated: Crashed state is persisted via CrashedFileName instead of CrashedExitCode.
 	CrashedExitCode           = 137
 	DefaultWaitPollIntervalMs = 50

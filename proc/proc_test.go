@@ -109,6 +109,81 @@ echo "stderr output line 1" >&2
 	}
 }
 
+func TestRun_SupervisedEnvVar_SetInChildren(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	// The tool prints the attested var and its own pid; the supervisor records its own
+	// pid in supervisor_pid. The env value MUST be that supervisor pid (provenance),
+	// not the tool's pid and not empty.
+	createExecutable(t, cwd, "env-supervise", `
+echo "SUPERVISED=$WACKYPROC_SUPERVISED"
+echo "MYPID=$$"
+`)
+
+	id, err := proc.Run(cwd, "env-supervise", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	completedID, err := proc.Wait(cwd, 5)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if completedID != id {
+		t.Fatalf("expected completed ID %q, got %q", id, completedID)
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if err := proc.Get(cwd, id, &stdoutBuf, &stderrBuf); err != nil {
+		t.Fatalf("proc.Get failed: %v", err)
+	}
+	stdout := stdoutBuf.String()
+
+	var supervised string
+	var myPID string
+	for _, line := range strings.Split(stdout, "\n") {
+		if v, ok := strings.CutPrefix(line, "SUPERVISED="); ok {
+			supervised = v
+		}
+		if v, ok := strings.CutPrefix(line, "MYPID="); ok {
+			myPID = v
+		}
+	}
+
+	if supervised == "" {
+		t.Fatalf("WACKYPROC_SUPERVISED not present in child env; stdout: %q (stderr: %q)", stdout, stderrBuf.String())
+	}
+	supPID, err := strconv.Atoi(supervised)
+	if err != nil || supPID <= 0 {
+		t.Fatalf("WACKYPROC_SUPERVISED = %q, want a positive pid", supervised)
+	}
+	if supervised == myPID {
+		t.Fatalf("WACKYPROC_SUPERVISED = %q must be the SUPERVISOR's pid, not the tool's own pid", supervised)
+	}
+
+	// The value must match the supervisor pid the machinery recorded for liveness.
+	recorded := readSupervisorPidFile(cwd, id)
+	if recorded <= 0 {
+		t.Fatalf("supervisor_pid record missing/zero for %s", id)
+	}
+	if supPID != recorded {
+		t.Fatalf("WACKYPROC_SUPERVISED = %d, want recorded supervisor pid %d", supPID, recorded)
+	}
+}
+
+// readSupervisorPidFile reads .proc/<id>/supervisor_pid directly (external test package).
+func readSupervisorPidFile(cwd, id string) int {
+	data, err := os.ReadFile(filepath.Join(cwd, proc.ProcDirName, id, proc.SupervisorPIDFileName))
+	if err != nil {
+		return 0
+	}
+	val, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	return val
+}
+
 func TestRun_WithStdin(t *testing.T) {
 	cwd := setupTestEnv(t)
 
