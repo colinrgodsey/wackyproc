@@ -62,6 +62,28 @@ SIGKILL of the whole process group).
 
 Stop, crash detection, and liveness all operate on the process *group*, not the PID: `stop` signals the group so grandchildren die with the child, and a record is only `RUNNING` while its group is alive. This is what makes `stop` reliable against multi-process trees (`npx → node → server`) that bare-PID management would orphan.
 
+## Install
+
+Requires Go 1.21+ (no CGO). Install the latest release directly:
+
+```bash
+go install github.com/colinrgodsey/wackyproc@latest
+```
+
+The binary lands in `$(go env GOPATH)/bin/wackyproc` (usually `~/go/bin/wackyproc`); make sure that directory is on your `PATH`.
+
+To pin to a specific checkout instead, build from the source tree:
+
+```bash
+go build -o bin/wackyproc .
+```
+
+Verify the install with a one-line smoke test:
+
+```bash
+wackyproc --help
+```
+
 ## Build & Test
 
 ```bash
