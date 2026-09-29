@@ -1,29 +1,19 @@
 package proc
 
 import (
-	"crypto/rand"
 	"fmt"
-	"math/big"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
+
+	"github.com/colinrgodsey/wackypub/pkg/slug"
 )
 
-const charset = "0123456789abcdefghijklmnopqrstuvwxyz"
-
-// GenerateRandomID generates a random 4-character alphanumeric string.
+// GenerateRandomID generates an 8-character pronounceable slug ID (4 CVCV
+// syllables, 24 bits of entropy via crypto/rand) using the shared scheme from
+// wackypub's pkg/slug - a single source of truth for ID generation across the
+// tool suite (Colin 2026-09-29).
 func GenerateRandomID() string {
-	var result strings.Builder
-	for i := 0; i < IDLength; i++ {
-		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
-		if err != nil {
-			result.WriteByte(charset[time.Now().UnixNano()%int64(len(charset))])
-			continue
-		}
-		result.WriteByte(charset[n.Int64()])
-	}
-	return result.String()
+	return slug.New()
 }
 
 // ClaimUniqueProcessDir generates a unique 4-character ID and atomically creates its directory
