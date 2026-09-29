@@ -57,6 +57,8 @@ func acquireSeqLock(procBaseDir string) (func(), error) {
 		err := os.Mkdir(lockDir, 0755)
 		if err == nil {
 			return func() {
+				// Best-effort lock release: if removing lockDir fails (e.g. permission or already removed),
+				// subsequent acquirers will fall back to stale-lock recovery after seqLockStaleAge.
 				_ = os.Remove(lockDir)
 			}, nil
 		}
@@ -68,6 +70,8 @@ func acquireSeqLock(procBaseDir string) (func(), error) {
 			if !staleRecovered {
 				fi, statErr := os.Stat(lockDir)
 				if statErr == nil && time.Since(fi.ModTime()) > seqLockStaleAge {
+					// Best-effort stale lock recovery: if another process already removed or stole it,
+					// next loop iteration will re-attempt Mkdir or hit the timeout.
 					_ = os.Remove(lockDir)
 					staleRecovered = true
 					continue
@@ -115,6 +119,8 @@ func nextSeq(procBaseDir string) (uint64, error) {
 		return 0, fmt.Errorf("failed to write temporary sequence file: %w", err)
 	}
 	if err := os.Rename(tmpPath, seqPath); err != nil {
+		// Best-effort cleanup: remove temporary sequence file after rename failure to prevent tmp accumulation;
+		// failure to remove does not supersede returning the rename error.
 		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("failed to rename sequence file: %w", err)
 	}
