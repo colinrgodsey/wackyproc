@@ -32,7 +32,7 @@ Use `wackyproc run` instead of synchronous `run_command` for:
 ## Multi-Turn Agent Workflow
 
 ### 1. Launch a Background Process (Turn 1)
-Spawn the process in the background. `wackyproc` immediately returns a 4-character process ID (e.g. `a1b2`):
+Spawn the process in the background. `wackyproc` immediately returns an 8-character pronounceable slug process ID (e.g. `katoruvo`):
 ```bash
 wackyproc run build-tool --release
 # Output: a1b2
@@ -126,7 +126,7 @@ The supervised async pattern for an agent-to-agent dispatch:
 wackyproc run wackypub agent <target> prompt --async "...NO_RESPONSE..."
 ```
 
-The caller gets back a 4-character process ID immediately, then polls with
+The caller gets back an 8-character pronounceable slug process ID immediately, then polls with
 `wackyproc list` / `wackyproc wait --for <id>` and retrieves the target's
 model output from stdout with `wackyproc get <id>`. The NO_RESPONSE suffix is a
 token-saver convention, not a guarantee: a model that ignores it just

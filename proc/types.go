@@ -26,7 +26,7 @@ const (
 	CrashedExitCode           = 137
 	DefaultWaitPollIntervalMs = 50
 	StopGracePeriodMs         = 3000
-	IDLength                  = 4
+	IDLength                  = 8
 	MaxIDGenerationRetries    = 100
 	MaxWaitSeconds            = 500
 

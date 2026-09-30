@@ -1837,3 +1837,19 @@ func TestCrashMarker_Lifecycle(t *testing.T) {
 		t.Errorf("expected to find %s in list", sigkillID)
 	}
 }
+
+// TestIsProcessRecordDir_LegacyAndSlug verifies the record-dir gate accepts both the
+// legacy 4-char [0-9a-z] token and the new 8-char lowercase slug, and rejects non-record
+// dirs.
+func TestIsProcessRecordDir_LegacyAndSlug(t *testing.T) {
+	for _, ok := range []string{"gk92", "katoruvo"} {
+		if !proc.IsProcessRecordDir(ok) {
+			t.Errorf("IsProcessRecordDir(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{"", "abc", "abcdE", "a1b2c3d4e5", ".seq.lock", "tmp-"} {
+		if proc.IsProcessRecordDir(bad) {
+			t.Errorf("IsProcessRecordDir(%q) = true, want false", bad)
+		}
+	}
+}

@@ -20,10 +20,13 @@ const (
 
 var seqLockMu sync.Mutex
 
-// IsProcessRecordDir returns true if name is exactly IDLength (4) characters drawn from [0-9a-z].
-// Non-record directories such as .seq.lock, temporary files, or dotfiles return false.
+// IsProcessRecordDir returns true if name is a record directory: either a legacy
+// 4-character [0-9a-z] token or the newer 8-character lowercase pronounceable slug
+// (pkg/slug; IDLength). Old-format record dirs stay valid - IDs are opaque, so no
+// migration. Non-record directories such as .seq.lock, temporary files, or dotfiles
+// return false.
 func IsProcessRecordDir(name string) bool {
-	if len(name) != IDLength {
+	if len(name) != IDLength && len(name) != 4 {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
