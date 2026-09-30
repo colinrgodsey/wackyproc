@@ -323,6 +323,30 @@ var unconsumeCmd = &cobra.Command{
 	},
 }
 
+var removeCmd = &cobra.Command{
+	Use:   "remove <proc_id>",
+	Short: "Force-dispose a process record (any status) without waiting for process exit",
+	Long: `Force-disposes the record of a stuck process: unlike prune, it works on RUNNING records,
+	which prune can never clear because a process that died or hung outside the supervisor's
+	capture window has no exit. The process itself is NOT signaled - if it is still alive it
+	kkeeps running unmanaged, so stop or kill it first if you want it gone. The record's ID is
+	recorded as disposed and will never be re-claimed.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+
+		toolName, err := proc.Remove(cwd, args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("removed %s (%s)\n", args[0], toolName)
+		return nil
+	},
+}
+
 var superviseCmd = &cobra.Command{
 	Use:    "__supervise <proc_dir>",
 	Short:  "Internal supervisor runner (hidden)",
@@ -373,6 +397,7 @@ func init() {
 	rootCmd.AddCommand(signalCmd)
 	rootCmd.AddCommand(pruneCmd)
 	rootCmd.AddCommand(unconsumeCmd)
+	rootCmd.AddCommand(removeCmd)
 	rootCmd.AddCommand(skillCmd)
 	rootCmd.AddCommand(superviseCmd)
 }

@@ -106,10 +106,33 @@ func statusFromTerminal(procDir string) (string, *int, bool) {
 }
 
 // isSupervisorFinalizing checks if supervisor is still alive and finalizing exit_code.
+// A zombie supervisor (exited or killed but not yet reaped by its parent) passes the
+// zero-signal check yet can never finalize, so it does not count as finalizing.
 func isSupervisorFinalizing(procDir string) bool {
 	if supPID := readRecordInt(procDir, SupervisorPIDFileName); supPID > 0 {
 		if supProc, supErr := os.FindProcess(supPID); supErr == nil && supProc.Signal(syscall.Signal(0)) == nil {
-			return true
+			if !isZombie(supPID) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isZombie reports whether pid is a zombie: exited but not yet reaped. The state field
+// is the first field after the closing paren of /proc/<pid>/stat. Non-Linux or an
+// unreadable stat yields false, keeping the conservative (assume finalizing) behavior.
+func isZombie(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	lastParen := strings.LastIndex(content, ")")
+	if lastParen != -1 && lastParen+1 < len(content) {
+		fields := strings.Fields(content[lastParen+1:])
+		if len(fields) > 0 {
+			return fields[0] == "Z"
 		}
 	}
 	return false

@@ -108,6 +108,7 @@ wackyproc signal a1b2 15
   ```bash
   wackyproc unconsume a1b2
   ```
+- **Force-dispose a stuck record**: `wackyproc remove a1b2` - works on RUNNING records that prune can never clear (the process died or hung outside the supervisor's capture window, so it has no exit and will never go terminal). The process is NOT signaled - stop or kill it first if you want it gone. The record's ID is recorded as disposed and never re-claimed.
 
 ---
 
