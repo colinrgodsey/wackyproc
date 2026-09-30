@@ -49,14 +49,37 @@ type Meta struct {
 	ConsumedSeq uint64   `json:"consumed_seq,omitempty"`
 }
 
-// ProcessInfo represents the user-visible status of a process.
+// ProcessInfo represents the user-visible status of a process. Args is deliberately
+// EXCLUDED from JSON serialization (json:"-"): list --json must stay compact no matter how
+// large the per-command args are (agent prompts, scratchpad hand-offs can be multi-KB;
+// tasks/wackyproc/list-describe-split). Full args live in DescribeInfo, served by Describe.
 type ProcessInfo struct {
 	ID        string   `json:"id"`
 	Tool      string   `json:"tool"`
-	Args      []string `json:"args"`
+	Args      []string `json:"-"`
 	Status    string   `json:"status"`
 	PID       int      `json:"pid,omitempty"`
 	PGID      int      `json:"pgid,omitempty"`
 	ExitCode  *int     `json:"exit_code,omitempty"`
 	StartedAt int64    `json:"started_at"`
+}
+
+// DescribeInfo is the full-detail view of ONE process record, served by Describe and the
+// wackyproc describe command. Unlike ProcessInfo it carries the complete Args plus the
+// surrounding metadata (cwd, tool path, output locations, consumed state).
+type DescribeInfo struct {
+	ID         string   `json:"id"`
+	Tool       string   `json:"tool"`
+	ToolPath   string   `json:"tool_path"`
+	Args       []string `json:"args"`
+	Cwd        string   `json:"cwd"`
+	Status     string   `json:"status"`
+	PID        int      `json:"pid,omitempty"`
+	PGID       int      `json:"pgid,omitempty"`
+	ExitCode   *int     `json:"exit_code,omitempty"`
+	StartedAt  int64    `json:"started_at"`
+	Consumed   bool     `json:"consumed"`
+	StdoutFile string   `json:"stdout_file"`
+	StderrFile string   `json:"stderr_file"`
+	StdinFile  string   `json:"stdin_file,omitempty"`
 }

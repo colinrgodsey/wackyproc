@@ -53,6 +53,8 @@ wackyproc list
 
 # Machine-readable JSON output:
 wackyproc list --json
+
+Note: `list --json` is COMPACT by contract - it returns only the table fields plus timestamps and NEVER includes command args (they can be multi-KB prompts). For full args use `wackyproc describe <proc_id>` / `describe --json`.
 ```
 
 ### 3. Wait for Background Jobs to Finish
