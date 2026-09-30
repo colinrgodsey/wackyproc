@@ -25,10 +25,11 @@ var (
 var bundledWackyprocSkill string
 
 var (
-	jsonOutput  bool
-	stopTimeout int
-	waitFor     string
-	peekLines   int
+	jsonOutput   bool
+	describeJSON bool
+	stopTimeout  int
+	waitFor      string
+	peekLines    int
 )
 
 var rootCmd = &cobra.Command{
@@ -193,6 +194,90 @@ If the timeout expires before a process finishes, exits non-zero.`,
 		}
 
 		fmt.Println(procID)
+		return nil
+	},
+}
+
+var describeCmd = &cobra.Command{
+	Use:   "describe \u003cproc_id\u003e [more ids...]",
+	Short: "Show full details for one or more tracked processes",
+	Long: `Shows full details for the specified process ID(s): complete command args, working
+directory, tool path, status, pid/pgid, exit code, timestamps, captured-output file
+locations, and whether the record has been consumed. Does NOT mark the record consumed
+and does NOT print captured output (use get). With --json, emits a JSON array of the
+records; without, prints a human-readable block per record.`,
+	Args: cobra.MinimumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+
+		if describeJSON {
+			infos := make([]*proc.DescribeInfo, 0, len(args))
+			for _, procID := range args {
+				info, err := proc.Describe(cwd, procID)
+				if err != nil {
+					return err
+				}
+				infos = append(infos, info)
+			}
+			data, err := json.MarshalIndent(infos, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Println(string(data))
+			return nil
+		}
+
+		for _, procID := range args {
+			info, err := proc.Describe(cwd, procID)
+			if err != nil {
+				return err
+			}
+
+			exitStr := "-"
+			if info.ExitCode != nil {
+				exitStr = strconv.Itoa(*info.ExitCode)
+			}
+			pidStr := "-"
+			if info.PID > 0 {
+				pidStr = strconv.Itoa(info.PID)
+			}
+			consumed := "no"
+			if info.Consumed {
+				consumed = "yes"
+			}
+
+			fmt.Printf("ID:        %s\n", info.ID)
+			fmt.Printf("Tool:      %s\n", info.Tool)
+			if info.ToolPath != "" {
+				fmt.Printf("ToolPath:  %s\n", info.ToolPath)
+			}
+			fmt.Printf("Status:    %s\n", info.Status)
+			fmt.Printf("PID:       %s\n", pidStr)
+			if info.PGID > 0 {
+				fmt.Printf("PGID:      %d\n", info.PGID)
+			}
+			fmt.Printf("Exit:      %s\n", exitStr)
+			fmt.Printf("Cwd:       %s\n", info.Cwd)
+			fmt.Printf("Started:   %d\n", info.StartedAt)
+			fmt.Printf("Consumed:  %s\n", consumed)
+			fmt.Printf("Stdout:    %s\n", info.StdoutFile)
+			fmt.Printf("Stderr:    %s\n", info.StderrFile)
+			if info.StdinFile != "" {
+				fmt.Printf("Stdin:     %s\n", info.StdinFile)
+			}
+			if len(info.Args) > 0 {
+				fmt.Printf("Args:\n")
+				for _, a := range info.Args {
+					fmt.Printf("  %s\n", a)
+				}
+			} else {
+				fmt.Printf("Args:      (none)\n")
+			}
+			fmt.Println()
+		}
 		return nil
 	},
 }
@@ -369,6 +454,7 @@ var skillCmd = &cobra.Command{
 
 func init() {
 	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output process list as JSON")
+	describeCmd.Flags().BoolVar(&describeJSON, "json", false, "Output describe records as JSON")
 	stopCmd.Flags().IntVar(&stopTimeout, "timeout", proc.DefaultStopTimeoutSeconds, "Seconds to wait after SIGTERM before sending SIGKILL")
 	waitCmd.Flags().StringVar(&waitFor, "for", "", "Wait for a specific process ID to reach a terminal state")
 	peekCmd.Flags().IntVar(&peekLines, "lines", 20, "Number of trailing lines of stdout and stderr to show")
@@ -389,6 +475,7 @@ func init() {
 
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(describeCmd)
 	rootCmd.AddCommand(waitCmd)
 	rootCmd.AddCommand(getCmd)
 	rootCmd.AddCommand(peekCmd)

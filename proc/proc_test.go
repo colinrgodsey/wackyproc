@@ -1853,3 +1853,109 @@ func TestIsProcessRecordDir_LegacyAndSlug(t *testing.T) {
 		}
 	}
 }
+
+// TestList_CompactJSONExcludesArgs pins the list --json contract from
+// tasks/wackyproc/list-describe-split: list JSON must stay compact no matter how large
+// per-command args are (agent prompts). Args belong to Describe, never to list.
+func TestList_CompactJSONExcludesArgs(t *testing.T) {
+	cwd := setupTestEnv(t)
+	createExecutable(t, cwd, "argtool", "exit 0")
+
+	bigArg := strings.Repeat("p", 200*1024)
+	if _, err := proc.Run(cwd, "argtool", []string{bigArg}, nil); err != nil {
+		t.Fatalf("run argtool: %v", err)
+	}
+
+	list, err := proc.List(cwd)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	data, err := json.Marshal(list)
+	if err != nil {
+		t.Fatalf("marshal list: %v", err)
+	}
+
+	// The 200KB arg MUST NOT appear in list JSON - the whole output must stay small.
+	if strings.Contains(string(data), "ppppppppp") {
+		t.Fatal("list JSON contains the large arg - compact contract violated")
+	}
+	if len(data) > 16*1024 {
+		t.Fatalf("list JSON too large: %d bytes for a single record (200KB arg should not add size)", len(data))
+	}
+
+	// Compact shape: table fields + timestamps only.
+	var decoded []map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if len(decoded) == 0 {
+		t.Fatal("expected records")
+	}
+	for _, rec := range decoded {
+		if _, hasArgs := rec["args"]; hasArgs {
+			t.Errorf("list JSON must not include args, got %v", rec)
+		}
+		for _, want := range []string{"id", "tool", "status", "started_at"} {
+			if _, ok := rec[want]; !ok {
+				t.Errorf("list JSON missing %q, got %v", want, rec)
+			}
+		}
+	}
+}
+
+// TestDescribe_FullDetailsAndDoesNotConsume verifies describe returns complete args +
+// metadata and never marks the record consumed (Get is the only consumer).
+func TestDescribe_FullDetailsAndDoesNotConsume(t *testing.T) {
+	cwd := setupTestEnv(t)
+	createExecutable(t, cwd, "bigtool", "exit 0")
+
+	args := []string{"--prompt", strings.Repeat("p", 5000), "second"}
+	id, err := proc.Run(cwd, "bigtool", args, nil)
+	if err != nil {
+		t.Fatalf("run bigtool: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	info, err := proc.Describe(cwd, id)
+	if err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+	if info.ID != id {
+		t.Errorf("describe id = %q, want %q", info.ID, id)
+	}
+	if len(info.Args) != len(args) || info.Args[0] != "--prompt" {
+		t.Errorf("describe args = %v, want %v", info.Args, args)
+	}
+	if info.Cwd != cwd {
+		t.Errorf("describe cwd = %q, want %q", info.Cwd, cwd)
+	}
+	if info.Status == "" {
+		t.Errorf("describe status empty")
+	}
+	if info.StdoutFile == "" || info.StderrFile == "" {
+		t.Errorf("expected output file locations, got stdout=%q stderr=%q", info.StdoutFile, info.StderrFile)
+	}
+
+	// Describe must NOT mark consumed (Get's job).
+	meta, _ := os.ReadFile(filepath.Join(cwd, proc.ProcDirName, id, proc.MetaFileName))
+	var metaParsed proc.Meta
+	if err := json.Unmarshal(meta, &metaParsed); err != nil {
+		t.Fatalf("meta parse: %v", err)
+	}
+	if metaParsed.ConsumedSeq != 0 {
+		t.Errorf("describe marked record consumed (ConsumedSeq=%d) - should never consume", metaParsed.ConsumedSeq)
+	}
+	if info.Consumed {
+		t.Errorf("describe reported consumed=true before any Get")
+	}
+}
+
+// TestDescribe_NotFound verifies describe errors cleanly on a missing id.
+func TestDescribe_NotFound(t *testing.T) {
+	cwd := setupTestEnv(t)
+	if _, err := proc.Describe(cwd, "no-such-record"); err == nil {
+		t.Fatal("expected error describing missing record")
+	}
+}

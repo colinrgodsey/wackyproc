@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -589,5 +590,93 @@ func TestUnconsumeCmd_CLI(t *testing.T) {
 	err = rootCmd.Execute()
 	if err == nil {
 		t.Errorf("expected error with 0 args, got nil")
+	}
+}
+
+func TestDescribeCmd_CLI(t *testing.T) {
+	tmpDir := t.TempDir()
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	toolsDir := filepath.Join(tmpDir, "tools")
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("mkdir tools: %v", err)
+	}
+	toolScript := "#!/bin/sh\necho done\n"
+	if err := os.WriteFile(filepath.Join(toolsDir, "cli-tool"), []byte(toolScript), 0755); err != nil {
+		t.Fatalf("write tool: %v", err)
+	}
+
+	args := []string{"--prompt", strings.Repeat("z", 5000), "tail"}
+	id, err := proc.Run(tmpDir, "cli-tool", args, nil)
+	if err != nil {
+		t.Fatalf("proc.Run: %v", err)
+	}
+	if _, err := proc.Wait(tmpDir, 5); err != nil {
+		t.Fatalf("proc.Wait: %v", err)
+	}
+
+	// 1. Text describe shows the full args. fmt.Printf goes to os.Stdout, so capture via pipe.
+	assertDescribeOutput := func(args ...string) string {
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		origStdout := os.Stdout
+		os.Stdout = w
+		rootCmd.SetArgs(args)
+		execErr := rootCmd.Execute()
+		w.Close()
+		os.Stdout = origStdout
+		if execErr != nil {
+			t.Fatalf("command %v: %v", args, execErr)
+		}
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		return buf.String()
+	}
+
+	out := assertDescribeOutput("describe", id)
+	if !strings.Contains(out, "Args:") {
+		t.Errorf("describe text missing Args section: %q", out)
+	}
+	if !strings.Contains(out, "--prompt") || !strings.Contains(out, "tail") {
+		t.Errorf("describe text missing full args: %q", out)
+	}
+
+	// 2. describe --json emits valid JSON with args but no consumption.
+	var infos []map[string]any
+	jsonOut := assertDescribeOutput("describe", id, "--json")
+	if err := json.Unmarshal([]byte(jsonOut), &infos); err != nil {
+		t.Fatalf("describe --json not valid JSON: %v (out: %s)", err, jsonOut)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("expected 1 describe record, got %d", len(infos))
+	}
+	if _, hasArgs := infos[0]["args"]; !hasArgs {
+		t.Errorf("describe json missing args key: %v", infos[0])
+	}
+	if consumed, _ := infos[0]["consumed"].(bool); consumed {
+		t.Errorf("describe json reported consumed=true after no get")
+	}
+
+	// 3. list --json stays compact (no args) even for this big-arg record.
+	listOut := assertDescribeOutput("list", "--json")
+	if strings.Contains(listOut, "zzzzzzzzz") {
+		t.Fatal("list --json contains the huge arg - compact contract violated")
+	}
+}
+
+func TestDescribeCmd_CLI_MissingArgFails(t *testing.T) {
+	rootCmd.SetArgs([]string{"describe"})
+	err := rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for describe with no id")
 	}
 }

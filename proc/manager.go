@@ -251,6 +251,49 @@ type consumedTerminalRecord struct {
 	path string
 }
 
+// Describe returns the full-detail view of a single process record (args, cwd, tool path,
+// output-file locations, consumed state) without marking it consumed. This backs the
+// wackyproc describe command; it never touches ConsumedSeq (use Get to drain output).
+func Describe(cwd string, procID string) (*DescribeInfo, error) {
+	procDir := filepath.Join(cwd, ProcDirName, procID)
+	if _, err := os.Stat(procDir); os.IsNotExist(err) {
+		return nil, fmt.Errorf("process %q not found", procID)
+	}
+
+	meta, err := readMeta(procDir)
+	if err != nil {
+		return nil, fmt.Errorf("reading meta for %q: %w", procID, err)
+	}
+
+	liveness, err := CheckLiveness(procDir, &meta)
+	if err != nil {
+		return nil, fmt.Errorf("checking liveness for %q: %w", procID, err)
+	}
+
+	stdinPath := filepath.Join(procDir, StdinFileName)
+	stdinFile := ""
+	if _, err := os.Stat(stdinPath); err == nil {
+		stdinFile = stdinPath
+	}
+
+	return &DescribeInfo{
+		ID:         procID,
+		Tool:       meta.Tool,
+		ToolPath:   meta.ToolPath,
+		Args:       meta.Args,
+		Cwd:        meta.Cwd,
+		Status:     liveness.Status,
+		PID:        liveness.PID,
+		PGID:       liveness.PGID,
+		ExitCode:   liveness.ExitCode,
+		StartedAt:  meta.StartedAt,
+		Consumed:   meta.ConsumedSeq > 0,
+		StdoutFile: filepath.Join(procDir, StdoutFileName),
+		StderrFile: filepath.Join(procDir, StderrFileName),
+		StdinFile:  stdinFile,
+	}, nil
+}
+
 // disposeConsumedTerminals disposes consumed terminal records in ascending Gen order
 // if the total terminal record count exceeds MaxTerminalEntries.
 // Unconsumed terminal records and RUNNING processes are NEVER auto-disposed.

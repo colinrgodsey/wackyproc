@@ -15,7 +15,8 @@ In turn-based agent runtimes (like [wackypub](https://github.com/colinrgodsey/wa
 ## Commands
 
 - `wackyproc run <tool> [args...]`: Spawns `./tools/<tool>` as a detached background process and outputs its 8-character pronounceable slug ID (e.g. `katoruvo`). Stdin piped into `run` is drained into `.proc/<id>/stdin` before detaching.
-- `wackyproc list [--json]`: Lists all tracked processes (`ID STATUS TOOL PID EXIT`) and their current status (`RUNNING`, `COMPLETED`, `FAILED`, `CRASHED`).
+- `wackyproc list [--json]`: Lists all tracked processes (`ID STATUS TOOL PID EXIT`) and their current status (`RUNNING`, `COMPLETED`, `FAILED`, `CRASHED`). `--json` is COMPACT by contract: it returns only the table fields plus timestamps (id, tool, status, pid, pgid, exit_code, started_at) and deliberately EXCLUDES command args - a dispatch's args can be multi-KB (agent prompts), and list is the status snapshot; use `describe` for full args.
+- `wackyproc describe <proc_id> [more ids...] [--json]`: Full detail for one or more records - complete command args, cwd, tool path, output-file locations, consumed state. Does not mark consumed.
 - `wackyproc wait [seconds]`: Blocks up to N seconds (default 500) until a process that was **still running when the call began** finishes. Processes already terminal at entry are never reported, and the call blocks to the timeout when there is nothing pending, exiting non-zero.
 - `wackyproc wait --for <proc_id> [seconds]`: Blocks until that specific process finishes, reporting it immediately if it is already terminal. Fails immediately if the ID does not exist.
 - `wackyproc get <proc_id>`: Dumps captured stdout and stderr to the terminal and marks terminal records as consumed (retrieval = consumption).
