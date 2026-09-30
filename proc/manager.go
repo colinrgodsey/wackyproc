@@ -308,6 +308,7 @@ func disposeConsumedTerminals(procBaseDir string) {
 		// Get already returns 'process "id" not found' when os.Stat fails or files disappear,
 		// so concurrent reads cleanly return not-found rather than crashing or returning partial output.
 		if err := os.RemoveAll(rec.path); err == nil {
+			recordDisposedID(procBaseDir, rec.id)
 			terminalCount--
 		}
 	}
@@ -868,6 +869,7 @@ func Prune(cwd string, report io.Writer) error {
 			if err := os.RemoveAll(procDir); err != nil {
 				return fmt.Errorf("failed to remove process record %s: %w", procID, err)
 			}
+			recordDisposedID(procBaseDir, procID)
 			if report != nil {
 				fmt.Fprintf(report, "pruned %s (%s)\n", procID, toolName)
 			}
@@ -916,4 +918,31 @@ func Unconsume(cwd string, procID string) error {
 	}
 
 	return nil
+}
+
+// Remove force-disposes a process record regardless of status or consumed state. This is
+// the escape hatch for stuck RUNNING records: a process that died (or hung) outside the
+// supervisor's capture window leaves no exit, so prune - which only touches terminal
+// records - can never clear it. The process itself is NOT signaled: if it is still alive
+// it keeps running unmanaged, so stop or kill it first if you want it gone. The record's
+// ID is added to the disposed list and never re-claimed. Returns the tool name for reporting.
+func Remove(cwd string, procID string) (string, error) {
+	procBaseDir := filepath.Join(cwd, ProcDirName)
+	procDir := filepath.Join(procBaseDir, procID)
+	if _, err := os.Stat(procDir); os.IsNotExist(err) {
+		return "", fmt.Errorf("process %q not found", procID)
+	}
+
+	// meta only supplies the reported tool name; an unreadable record is still removable.
+	meta, _ := readMeta(procDir)
+	toolName := meta.Tool
+	if toolName == "" {
+		toolName = procID
+	}
+
+	if err := os.RemoveAll(procDir); err != nil {
+		return "", fmt.Errorf("failed to remove process record %s: %w", procID, err)
+	}
+	recordDisposedID(procBaseDir, procID)
+	return toolName, nil
 }

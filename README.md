@@ -22,12 +22,14 @@ In turn-based agent runtimes (like [wackypub](https://github.com/colinrgodsey/wa
 - `wackyproc peek <proc_id> [--lines N]`: Shows the trailing N lines (default 20) of captured stdout/stderr without a full dump, and never marks the record as consumed (unlike `get`).
 - `wackyproc unconsume <proc_id>`: Clears the consumed sequence number of a process record, preserving it from auto-disposal.
 - `wackyproc prune`: Disposes all terminal process records regardless of consumed state and reports removed IDs.
+- `wackyproc remove <proc_id>`: Force-disposes a record regardless of status or consumed state - the escape hatch for stuck `RUNNING` records that `prune` can never clear (a process that died or hung outside the supervisor's capture window has no exit). The process is NOT signaled: if it is still alive it keeps running unmanaged, so stop or kill it first if you want it gone.
 - `wackyproc stop <proc_id> [--timeout N]`: Gracefully stops the whole process group via `SIGTERM`, falling back to `SIGKILL` after N seconds (default 3).
 - `wackyproc skill`: Prints the bundled agent skill guide (`skills/wackyproc/SKILL.md`, embedded in the binary).
 
 ## Consumption semantics and status taxonomy
 
 Each record carries a consumed sequence number. `get` on a terminal record marks it consumed; `peek` never does; `unconsume` clears it. Terminal records are retained up to a cap (`MaxTerminalEntries = 100`, deliberately below the 300-entry scratchpad cap since records carry captured output) — `unconsume` preserves a record from auto-disposal, `prune` disposes terminal records regardless.
+`remove` disposes a specific record in any state. Every disposal path records the ID in a disposed list, and ID generation never re-claims a disposed ID, so a fresh dispatch cannot inherit an ID that logs still reference from the previous record.
 
 Status is derived from liveness plus exit code, never stored:
 
