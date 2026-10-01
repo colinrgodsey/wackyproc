@@ -23,12 +23,19 @@ const (
 	StatusFailed     = "FAILED"
 	StatusCrashed    = "CRASHED"
 	// Deprecated: Crashed state is persisted via CrashedFileName instead of CrashedExitCode.
-	CrashedExitCode           = 137
-	DefaultWaitPollIntervalMs = 50
-	StopGracePeriodMs         = 3000
-	IDLength                  = 8
-	MaxIDGenerationRetries    = 100
-	MaxWaitSeconds            = 500
+	CrashedExitCode = 137
+	// Wait polling ramp (tasks/wackyproc/wait-polling-ramp): the first WaitPollRampCount
+	// polls run at WaitPollStartIntervalMs so short tasks are still detected within a
+	// couple of intervals of finishing, then the interval doubles per poll
+	// (waitPollIntervalMs) until it settles at WaitPollSettleIntervalMs - a 10-minute
+	// wait stops paying 20Hz CheckLiveness for a process that is clearly long-running.
+	WaitPollStartIntervalMs  = 100
+	WaitPollRampCount        = 10
+	WaitPollSettleIntervalMs = 1000
+	StopGracePeriodMs        = 3000
+	IDLength                 = 8
+	MaxIDGenerationRetries   = 100
+	MaxWaitSeconds           = 500
 
 	// MaxTerminalEntries caps how many terminal (COMPLETED, FAILED, CRASHED) process
 	// records are retained. A retunable starting default, deliberately below the

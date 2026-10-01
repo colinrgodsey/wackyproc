@@ -645,11 +645,30 @@ func findTerminalProcess(cwd string, list []ProcessInfo, hasTarget bool, target 
 	return "", false, nil
 }
 
-// Wait blocks up to timeoutSeconds for a background process to reach a terminal state.
-// If targetID is provided, Wait blocks until that specific process reaches a terminal state;
-// baseline exclusion does not apply to a targeted wait.
-// If targetID is omitted, Wait blocks until any process that was still running when the call began
-// reaches a terminal state, ignoring processes already terminal when the call started.
+// waitPollIntervalMs is the wait-loop poll interval to sleep after pollsSoFar
+// polls: the first WaitPollRampCount polls keep the start interval (short tasks are
+// still detected within ~2 intervals of finishing), then the interval doubles per
+// poll until it settles at WaitPollSettleIntervalMs (low-duty-cycle CPU for long
+// waits).
+func waitPollIntervalMs(pollsSoFar int) int {
+	if pollsSoFar < WaitPollRampCount {
+		return WaitPollStartIntervalMs
+	}
+	// Wait blocks up to timeoutSeconds for a background process to reach a terminal state.
+	// If targetID is provided, Wait blocks until that specific process reaches a terminal state;
+	// baseline exclusion does not apply to a targeted wait.
+	// If targetID is omitted, Wait blocks until any process that was still running when the call began
+	// reaches a terminal state, ignoring processes already terminal when the call started.
+	iv := WaitPollStartIntervalMs
+	for i := 0; i < pollsSoFar-WaitPollRampCount+1; i++ {
+		iv *= 2
+		if iv >= WaitPollSettleIntervalMs {
+			return WaitPollSettleIntervalMs
+		}
+	}
+	return iv
+}
+
 // Returns the process ID of the completed process, or an empty string if the timeout expires.
 func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 	var target string
@@ -684,8 +703,11 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 	}
 
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
-	ticker := time.NewTicker(time.Duration(DefaultWaitPollIntervalMs) * time.Millisecond)
+	intervalMs := waitPollIntervalMs(0)
+	ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
 	defer ticker.Stop()
+
+	polls := 0
 
 	for {
 		list, err := List(cwd)
@@ -703,6 +725,11 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 			return "", nil
 		}
 
+		polls++
+		if iv := waitPollIntervalMs(polls); iv != intervalMs {
+			intervalMs = iv
+			ticker.Reset(time.Duration(iv) * time.Millisecond)
+		}
 		<-ticker.C
 	}
 }
