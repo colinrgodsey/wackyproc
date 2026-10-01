@@ -1959,3 +1959,29 @@ func TestDescribe_NotFound(t *testing.T) {
 		t.Fatal("expected error describing missing record")
 	}
 }
+
+// TestWait_ShortTaskLatency is the ramp acceptance for short tasks: a task finishing
+// in ~200ms is still reported promptly, because the ramp starts at the 100ms interval
+// (detection within ~2 intervals of completion).
+func TestWait_ShortTaskLatency(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "shorttool", `sleep 0.2`)
+	id, err := proc.Run(cwd, "shorttool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	start := time.Now()
+	resID, err := proc.Wait(cwd, 10)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if resID != id {
+		t.Fatalf("Wait returned %q, want %q", resID, id)
+	}
+	if elapsed > 1500*time.Millisecond {
+		t.Errorf("short-task latency regressed: Wait took %v for a 200ms task (polling ramp broken?)", elapsed)
+	}
+}
