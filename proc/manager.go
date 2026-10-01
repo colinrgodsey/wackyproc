@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -645,6 +646,37 @@ func findTerminalProcess(cwd string, list []ProcessInfo, hasTarget bool, target 
 	return "", false, nil
 }
 
+// eligibleRunningPids returns the pids of processes that Wait should block on:
+// for a targeted wait the target pid (if running, non-terminal), otherwise every
+// running non-terminal pid not excluded by the any-mode baseline. A non-terminal
+// record whose pid is not yet recorded (still spawning) sets anyNonTerminal so the
+// caller re-lists immediately instead of waiting a full polling tick.
+func eligibleRunningPids(list []ProcessInfo, hasTarget bool, target string, baselineTerminal map[string]bool) (pids []int, anyNonTerminal bool) {
+	if hasTarget {
+		for i := range list {
+			if list[i].ID == target {
+				if !isTerminal(list[i].Status) {
+					anyNonTerminal = true
+					if list[i].PID > 0 {
+						pids = append(pids, list[i].PID)
+					}
+				}
+				return pids, anyNonTerminal
+			}
+		}
+		return pids, anyNonTerminal
+	}
+	for _, p := range list {
+		if !isTerminal(p.Status) && !baselineTerminal[p.ID] {
+			anyNonTerminal = true
+			if p.PID > 0 {
+				pids = append(pids, p.PID)
+			}
+		}
+	}
+	return pids, anyNonTerminal
+}
+
 // waitPollIntervalMs is the wait-loop poll interval to sleep after pollsSoFar
 // polls: the first WaitPollRampCount polls keep the start interval (short tasks are
 // still detected within ~2 intervals of finishing), then the interval doubles per
@@ -669,8 +701,18 @@ func waitPollIntervalMs(pollsSoFar int) int {
 	return iv
 }
 
-// Returns the process ID of the completed process, or an empty string if the timeout expires.
+// Wait is the context-less wrapper over WaitContext.
 func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
+	return WaitContext(context.Background(), cwd, timeoutSeconds, targetID...)
+}
+
+// WaitContext blocks up to timeoutSeconds for a background process to reach a terminal
+// state, honoring ctx cancellation: if the ctx is cancelled (e.g. an agent turn cancel
+// downstream-cancels the tool running wackyproc wait), both the pidfd poll and the
+// polling ticker abort promptly and the ctx error is returned. The pidfd path races
+// the cancel by running poll in a goroutine and closing the fds on cancel (which
+// unblocks poll); the ticker path selects on ctx.Done().
+func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 	var target string
 	hasTarget := len(targetID) > 0
 	if hasTarget {
@@ -702,6 +744,7 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 		}
 	}
 
+	var pidfdTried bool
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
 	intervalMs := waitPollIntervalMs(0)
 	ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
@@ -725,12 +768,50 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 			return "", nil
 		}
 
+		// pidfd fast path (Linux): arm one pidfd per eligible running process and block
+		// until one exits or the deadline passes. Zero polling CPU and zero detection
+		// latency; the kernel wakes us exactly when the process exits. Falls back to the
+		// polling ramp on unsupported kernels / sandboxes / non-Linux. A wake is not a
+		// verdict - the loop re-runs List + findTerminalProcess, so the #13 zombie gate
+		// (CheckLiveness -> isZombie / pid-reuse detection) still composes.
+		// Try the pidfd path on the first successful arm only; once it fails for any
+		// reason (unsupported kernel, sandbox EPERM, process-gone ESRCH) fall back to
+		// the polling ramp for the rest of this wait rather than re-syscalling per tick.
+		if !pidfdTried {
+			pids, anyNonTerminal := eligibleRunningPids(list, hasTarget, target, baselineTerminal)
+			if len(pids) > 0 {
+				remaining := time.Until(deadline)
+				woke, _, perr := waitPidFDsContext(ctx, pids, remaining)
+				if perr != nil {
+					if errors.Is(perr, ErrPidFDProcessGone) {
+						// pidfd_open raced the reap: the process is gone (ESRCH). Re-list
+						// immediately - findTerminalProcess + CheckLiveness decide now.
+						continue
+					}
+					pidfdTried = true
+				} else if woke {
+					continue
+				} else {
+					return "", nil
+				}
+			} else if anyNonTerminal {
+				// Non-terminal record(s) exist but no pid is recorded yet (still spawning):
+				// re-list immediately so a fast-exiting process is caught on this cycle,
+				// not after a full 100ms tick.
+				continue
+			}
+		}
+
 		polls++
 		if iv := waitPollIntervalMs(polls); iv != intervalMs {
 			intervalMs = iv
 			ticker.Reset(time.Duration(iv) * time.Millisecond)
 		}
-		<-ticker.C
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/colinrgodsey/wackyproc/proc"
@@ -177,7 +179,13 @@ If the timeout expires before a process finishes, exits non-zero.`,
 			targetID = []string{waitFor}
 		}
 
-		procID, err := proc.Wait(cwd, timeoutSeconds, targetID...)
+		// Wire SIGINT/SIGTERM (agent turn cancel -> tool cancel -> wackyproc wait)
+		// into WaitContext so a cancelled wait aborts promptly instead of stubbornly
+		// waiting out the timeout or blocking in pidfd poll.
+		waitCtx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		procID, err := proc.WaitContext(waitCtx, cwd, timeoutSeconds, targetID...)
 		if err != nil {
 			if errors.Is(err, proc.ErrNothingToWaitFor) {
 				fmt.Println("nothing to wait for")
