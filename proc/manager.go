@@ -701,6 +701,11 @@ func waitPollIntervalMs(pollsSoFar int) int {
 	return iv
 }
 
+// ForcePollingFallbackForTest is a test-only escape hatch: when true, Wait skips the
+// pidfd fast path and uses the polling ramp fallback even on Linux where pidfd is
+// supported. Lets the fallback be exercised deterministically on any platform.
+var ForcePollingFallbackForTest bool
+
 // Wait is the context-less wrapper over WaitContext.
 func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 	return WaitContext(context.Background(), cwd, timeoutSeconds, targetID...)
@@ -777,7 +782,7 @@ func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, targetID .
 		// Try the pidfd path on the first successful arm only; once it fails for any
 		// reason (unsupported kernel, sandbox EPERM, process-gone ESRCH) fall back to
 		// the polling ramp for the rest of this wait rather than re-syscalling per tick.
-		if !pidfdTried {
+		if !pidfdTried && !ForcePollingFallbackForTest {
 			pids, anyNonTerminal := eligibleRunningPids(list, hasTarget, target, baselineTerminal)
 			if len(pids) > 0 {
 				remaining := time.Until(deadline)
