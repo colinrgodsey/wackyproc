@@ -236,8 +236,8 @@ func Run(cwd string, toolName string, args []string, stdinReader io.Reader) (str
 		return "", err
 	}
 
-	// Post-spawn disposal of consumed terminal records exceeding cap (D79)
-	disposeConsumedTerminals(procBaseDir)
+	// Post-spawn retirement of the oldest terminal records once the cap is exceeded.
+	retireOldestTerminals(procBaseDir)
 
 	return procID, nil
 }
@@ -246,15 +246,9 @@ func isTerminal(status string) bool {
 	return status == StatusCompleted || status == StatusFailed || status == StatusCrashed
 }
 
-type consumedTerminalRecord struct {
-	id   string
-	gen  uint64
-	path string
-}
-
 // Describe returns the full-detail view of a single process record (args, cwd, tool path,
-// output-file locations, consumed state) without marking it consumed. This backs the
-// wackyproc describe command; it never touches ConsumedSeq (use Get to drain output).
+// output-file locations). This backs the wackyproc describe command; it never
+// writes record state.
 func Describe(cwd string, procID string) (*DescribeInfo, error) {
 	procDir := filepath.Join(cwd, ProcDirName, procID)
 	if _, err := os.Stat(procDir); os.IsNotExist(err) {
@@ -288,79 +282,65 @@ func Describe(cwd string, procID string) (*DescribeInfo, error) {
 		PGID:       liveness.PGID,
 		ExitCode:   liveness.ExitCode,
 		StartedAt:  meta.StartedAt,
-		Consumed:   meta.ConsumedSeq > 0,
 		StdoutFile: filepath.Join(procDir, StdoutFileName),
 		StderrFile: filepath.Join(procDir, StderrFileName),
 		StdinFile:  stdinFile,
 	}, nil
 }
 
-// disposeConsumedTerminals disposes consumed terminal records in ascending Gen order
-// if the total terminal record count exceeds MaxTerminalEntries.
-// Unconsumed terminal records and RUNNING processes are NEVER auto-disposed.
-func disposeConsumedTerminals(procBaseDir string) {
+// retireOldestTerminals keeps the terminal record count at or below
+// MaxTerminalEntries by retiring the oldest terminal records (ascending Gen)
+// on overflow, regardless of any other state. There is no consumed
+// distinction: eviction is age-based, so a record can be retired whether or
+// not its output was ever read. Each retirement is logged; a failed
+// retirement is logged as an error and retried on the next cap check (the
+// record still counts toward the cap while it exists).
+func retireOldestTerminals(procBaseDir string) {
 	entries, err := os.ReadDir(procBaseDir)
 	if err != nil {
 		return
 	}
-
-	var terminalCount int
-	var consumedTerminals []consumedTerminalRecord
-
+	type retirement struct {
+		id   string
+		gen  uint64
+		path string
+	}
+	var terminals []retirement
 	for _, entry := range entries {
 		if !entry.IsDir() || !IsProcessRecordDir(entry.Name()) {
 			continue
 		}
 		procDir := filepath.Join(procBaseDir, entry.Name())
-		// Enumeration tolerates an unreadable record: skipping it is what lets a corrupt
-		// record still be pruned later instead of failing the whole scan.
 		meta, err := readMeta(procDir)
 		if err != nil {
 			continue
 		}
-
 		liveness, err := CheckLiveness(procDir, &meta)
-		if err != nil {
+		if err != nil || !isTerminal(liveness.Status) {
 			continue
 		}
-		if isTerminal(liveness.Status) {
-			terminalCount++
-			if meta.ConsumedSeq > 0 {
-				consumedTerminals = append(consumedTerminals, consumedTerminalRecord{
-					id:   meta.ID,
-					gen:  meta.Gen,
-					path: procDir,
-				})
-			}
-		}
+		terminals = append(terminals, retirement{meta.ID, meta.Gen, procDir})
 	}
-
-	if terminalCount <= MaxTerminalEntries || len(consumedTerminals) == 0 {
+	if len(terminals) <= MaxTerminalEntries {
 		return
 	}
-
-	// Sort consumed terminals by Gen ascending (lowest gen / oldest creation first)
-	sort.Slice(consumedTerminals, func(i, j int) bool {
-		return consumedTerminals[i].gen < consumedTerminals[j].gen
-	})
-
-	for _, rec := range consumedTerminals {
-		if terminalCount <= MaxTerminalEntries {
-			break
+	sort.SliceStable(terminals, func(i, j int) bool { return terminals[i].gen < terminals[j].gen })
+	for _, rec := range terminals[:len(terminals)-MaxTerminalEntries] {
+		if err := os.RemoveAll(rec.path); err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to retire terminal record %s: %v\n", rec.id, err)
+			continue
 		}
-		// Accepted race: another process may be reading this record while we remove it.
-		// Get already returns 'process "id" not found' when os.Stat fails or files disappear,
-		// so concurrent reads cleanly return not-found rather than crashing or returning partial output.
-		if err := os.RemoveAll(rec.path); err == nil {
-			recordDisposedID(procBaseDir, rec.id)
-			terminalCount--
-		}
+		recordDisposedID(procBaseDir, rec.id)
+		fmt.Fprintf(os.Stderr, "retired terminal record %s (cap %d)\n", rec.id, MaxTerminalEntries)
 	}
 }
 
-// List inspects all process directories in <cwd>/.proc/ and returns their status.
+// List inspects all process directories in <cwd>/.proc/ and returns their
+// status. Terminal record retirement runs before the snapshot, so a record
+// the cap is about to drop is never reported by the same call.
 func List(cwd string) ([]ProcessInfo, error) {
 	procBaseDir := filepath.Join(cwd, ProcDirName)
+	retireOldestTerminals(procBaseDir)
 	entries, err := os.ReadDir(procBaseDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -370,8 +350,6 @@ func List(cwd string) ([]ProcessInfo, error) {
 	}
 
 	var results []ProcessInfo
-	var terminalCount int
-	var consumedTerminalCount int
 
 	for _, entry := range entries {
 		if !entry.IsDir() || !IsProcessRecordDir(entry.Name()) {
@@ -388,13 +366,6 @@ func List(cwd string) ([]ProcessInfo, error) {
 		liveness, err := CheckLiveness(procDir, &meta)
 		if err != nil {
 			continue
-		}
-
-		if isTerminal(liveness.Status) {
-			terminalCount++
-			if meta.ConsumedSeq > 0 {
-				consumedTerminalCount++
-			}
 		}
 
 		toolName := meta.Tool
@@ -414,10 +385,6 @@ func List(cwd string) ([]ProcessInfo, error) {
 		})
 	}
 
-	if terminalCount > MaxTerminalEntries && consumedTerminalCount == 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d terminal process records exceed cap of %d with 0 disposable; run 'wackyproc prune' to clear\n", terminalCount, MaxTerminalEntries)
-	}
-
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].StartedAt < results[j].StartedAt
 	})
@@ -429,11 +396,16 @@ func List(cwd string) ([]ProcessInfo, error) {
 }
 
 // Get dumps captured stdout and stderr for procID to the provided writers.
-// When reading a terminal process for the first time (ConsumedSeq == 0), marks it as consumed
-// with a monotonic sequence number.
+// It streams output only: the record is not marked in any way, so it stays
+// eligible for cap retirement like any other terminal record. meta.json is
+// existence-checked but never modified: a record whose meta has been disposed
+// concurrently is reported as not found.
 func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writer) error {
 	procDir := filepath.Join(cwd, ProcDirName, procID)
 	if _, err := os.Stat(procDir); os.IsNotExist(err) {
+		return fmt.Errorf("process %q not found", procID)
+	}
+	if _, err := os.Stat(filepath.Join(procDir, MetaFileName)); os.IsNotExist(err) {
 		return fmt.Errorf("process %q not found", procID)
 	}
 
@@ -448,55 +420,6 @@ func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writ
 	if stderrData, err := os.ReadFile(stderrPath); err == nil && len(stderrData) > 0 {
 		if _, err := stderrWriter.Write(stderrData); err != nil {
 			return fmt.Errorf("failed to write stderr: %w", err)
-		}
-	}
-
-	// Output write succeeded. Now check if record should be marked as consumed (D79).
-	metaPath := filepath.Join(procDir, MetaFileName)
-	metaBytes, err := os.ReadFile(metaPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("process %q not found", procID)
-		}
-		fmt.Fprintf(os.Stderr, "warning: failed to read %s for process %q: %v\n", MetaFileName, procID, err)
-		return nil
-	}
-
-	var meta Meta
-	if err := json.Unmarshal(metaBytes, &meta); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to parse %s for process %q: %v\n", MetaFileName, procID, err)
-		return nil
-	}
-
-	liveness, err := CheckLiveness(procDir, &meta)
-	if err != nil {
-		return nil
-	}
-	if isTerminal(liveness.Status) && meta.ConsumedSeq == 0 {
-		seq, err := nextSeq(filepath.Join(cwd, ProcDirName))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to allocate consumed sequence for process %q: %v\n", procID, err)
-			return nil
-		}
-		meta.ConsumedSeq = seq
-
-		updatedBytes, err := json.MarshalIndent(meta, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to serialize %s for process %q: %v\n", MetaFileName, procID, err)
-			return nil
-		}
-
-		tmpPath := filepath.Join(procDir, fmt.Sprintf("meta.json.tmp.%d", time.Now().UnixNano()))
-		if err := os.WriteFile(tmpPath, updatedBytes, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to write %s for process %q: %v\n", tmpPath, procID, err)
-			return nil
-		}
-		if err := os.Rename(tmpPath, metaPath); err != nil {
-			// Best-effort cleanup: remove temporary meta file after rename failure to prevent tmp accumulation;
-			// failure to remove is secondary to the logged rename error.
-			_ = os.Remove(tmpPath)
-			fmt.Fprintf(os.Stderr, "warning: failed to rename %s for process %q: %v\n", MetaFileName, procID, err)
-			return nil
 		}
 	}
 
@@ -531,7 +454,7 @@ func trailingLines(data []byte, n int) []byte {
 
 // Peek writes the trailing lines of captured stdout and stderr for procID to the provided writers.
 // A file with fewer than lines is output in full. A final line without a trailing newline is preserved.
-// Empty streams write nothing. It performs no state modification and does not mark the process record as consumed.
+// Empty streams write nothing. It performs no state modification.
 func Peek(cwd string, procID string, lines int, stdoutWriter io.Writer, stderrWriter io.Writer) error {
 	// Package-level validation provides defense-in-depth for direct callers.
 	if lines < 1 {
@@ -580,117 +503,60 @@ func clampWaitSeconds(requested int) int {
 	return requested
 }
 
-// ErrNothingToWaitFor is returned by any-mode Wait when there is no process eligible to
-// wait on at call time (nothing running, nothing unknown). The CLI treats it as a
-// successful no-op rather than a timeout.
-var ErrNothingToWaitFor = errors.New("nothing to wait for")
-
-// buildBaselineTerminal records all processes that are already in a terminal state
-// when an untargeted Wait begins, so they can be excluded from satisfying the wait.
-// If no running processes are eligible to wait on, it returns ErrNothingToWaitFor.
-func buildBaselineTerminal(cwd string) (map[string]bool, error) {
-	baselineTerminal := make(map[string]bool)
-	initList, err := List(cwd)
-	if err != nil {
-		return nil, err
+// findCompleted maps each listed ID to its terminal state from a process
+// listing. A listed ID absent from the listing is an error (fail fast, like a
+// record that never existed). List already runs CheckLiveness per record, so
+// statuses are live and the #13 zombie gate composes with this wait.
+func findCompleted(list []ProcessInfo, ids []string) (map[string]bool, error) {
+	byID := make(map[string]ProcessInfo, len(list))
+	for _, p := range list {
+		byID[p.ID] = p
 	}
-	// Eligible = processes still running (or in any non-terminal state) at entry. If
-	// none exist there is nothing for an any-mode wait to observe: every record is
-	// already terminal, and a fresh process spawned after this call starts is not part
-	// of this wait's contract. Return immediately instead of burning the timeout.
-	anyEligible := false
-	for _, p := range initList {
+	terminal := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		p, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("process %q not found", id)
+		}
 		if isTerminal(p.Status) {
-			baselineTerminal[p.ID] = true
-		} else {
-			anyEligible = true
+			terminal[id] = true
 		}
 	}
-	if !anyEligible {
-		return nil, ErrNothingToWaitFor
-	}
-	return baselineTerminal, nil
+	return terminal, nil
 }
 
-// findTerminalProcess checks a process listing for completion against the target or baseline.
-func findTerminalProcess(cwd string, list []ProcessInfo, hasTarget bool, target string, baselineTerminal map[string]bool) (string, bool, error) {
-	if hasTarget {
-		var found *ProcessInfo
+// runningPidsFor returns the PIDs of the listed IDs still running per the
+// listing, for pidfd arming. anyPending is true when at least one listed ID is
+// non-terminal with no PID recorded yet (still spawning): the caller re-lists
+// immediately instead of sleeping a full polling tick.
+func runningPidsFor(list []ProcessInfo, ids []string, terminal map[string]bool) (pids []int, anyPending bool) {
+	for _, id := range ids {
+		if terminal[id] {
+			continue
+		}
 		for i := range list {
-			if list[i].ID == target {
-				found = &list[i]
-				break
-			}
-		}
-		if found == nil {
-			procDir := filepath.Join(cwd, ProcDirName, target)
-			if _, err := os.Stat(procDir); os.IsNotExist(err) {
-				return "", false, fmt.Errorf("process %q not found", target)
-			}
-			return "", false, nil
-		}
-		if isTerminal(found.Status) {
-			return found.ID, true, nil
-		}
-		return "", false, nil
-	}
-
-	for _, p := range list {
-		if isTerminal(p.Status) {
-			if baselineTerminal[p.ID] {
+			if list[i].ID != id {
 				continue
 			}
-			return p.ID, true, nil
-		}
-	}
-	return "", false, nil
-}
-
-// eligibleRunningPids returns the pids of processes that Wait should block on:
-// for a targeted wait the target pid (if running, non-terminal), otherwise every
-// running non-terminal pid not excluded by the any-mode baseline. A non-terminal
-// record whose pid is not yet recorded (still spawning) sets anyNonTerminal so the
-// caller re-lists immediately instead of waiting a full polling tick.
-func eligibleRunningPids(list []ProcessInfo, hasTarget bool, target string, baselineTerminal map[string]bool) (pids []int, anyNonTerminal bool) {
-	if hasTarget {
-		for i := range list {
-			if list[i].ID == target {
-				if !isTerminal(list[i].Status) {
-					anyNonTerminal = true
-					if list[i].PID > 0 {
-						pids = append(pids, list[i].PID)
-					}
-				}
-				return pids, anyNonTerminal
+			anyPending = true
+			if list[i].PID > 0 {
+				pids = append(pids, list[i].PID)
 			}
-		}
-		return pids, anyNonTerminal
-	}
-	for _, p := range list {
-		if !isTerminal(p.Status) && !baselineTerminal[p.ID] {
-			anyNonTerminal = true
-			if p.PID > 0 {
-				pids = append(pids, p.PID)
-			}
+			break
 		}
 	}
-	return pids, anyNonTerminal
+	return pids, anyPending
 }
 
 // waitPollIntervalMs is the wait-loop poll interval to sleep after pollsSoFar
-// polls: the first WaitPollRampCount polls keep the start interval (short tasks are
-// still detected within ~2 intervals of finishing), then the interval doubles per
-// poll until it settles at WaitPollSettleIntervalMs (low-duty-cycle CPU for long
-// waits).
+// polls: the first WaitPollRampCount polls keep the start interval (short tasks
+// are still detected within ~2 intervals of finishing), then the interval
+// doubles per poll until it settles at WaitPollSettleIntervalMs (low-duty-cycle
+// CPU for long waits).
 func waitPollIntervalMs(pollsSoFar int) int {
 	if pollsSoFar < WaitPollRampCount {
 		return WaitPollStartIntervalMs
 	}
-	// Wait blocks up to timeoutSeconds for a background process to reach a terminal state.
-	// If targetID is provided, Wait blocks until that specific process reaches a terminal state;
-	// baseline exclusion does not apply to a targeted wait.
-	// If targetID is omitted, Wait blocks until any process that was still running when the call began
-	// reaches a terminal state, ignoring processes already terminal when the call started.
 	iv := WaitPollStartIntervalMs
 	for i := 0; i < pollsSoFar-WaitPollRampCount+1; i++ {
 		iv *= 2
@@ -701,114 +567,182 @@ func waitPollIntervalMs(pollsSoFar int) int {
 	return iv
 }
 
-// ForcePollingFallbackForTest is a test-only escape hatch: when true, Wait skips the
-// pidfd fast path and uses the polling ramp fallback even on Linux where pidfd is
-// supported. Lets the fallback be exercised deterministically on any platform.
+// ForcePollingFallbackForTest is a test-only escape hatch: when true, Wait skips
+// the pidfd fast path and uses the polling ramp fallback even on Linux where
+// pidfd is supported. Lets the fallback be exercised deterministically on any
+// platform.
 var ForcePollingFallbackForTest bool
 
-// Wait is the context-less wrapper over WaitContext.
-func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
-	return WaitContext(context.Background(), cwd, timeoutSeconds, targetID...)
+// Wait is the context-less first-completed form of WaitContext.
+func Wait(cwd string, timeoutSeconds int, ids ...string) (string, error) {
+	return WaitContext(context.Background(), cwd, timeoutSeconds, ids...)
 }
 
-// WaitContext blocks up to timeoutSeconds for a background process to reach a terminal
-// state, honoring ctx cancellation: if the ctx is cancelled (e.g. an agent turn cancel
-// downstream-cancels the tool running wackyproc wait), both the pidfd poll and the
-// polling ticker abort promptly and the ctx error is returned. The pidfd path polls
-// in bounded slices (100ms) and checks ctx.Done() between them, so a cancel is
-// observed within one slice in the worst case; the ticker path selects on ctx.Done().
-func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, targetID ...string) (string, error) {
-	var target string
-	hasTarget := len(targetID) > 0
-	if hasTarget {
-		target = targetID[0]
+// WaitAll is the context-less barrier form of WaitAllContext.
+func WaitAll(cwd string, timeoutSeconds int, ids ...string) (string, error) {
+	return WaitAllContext(context.Background(), cwd, timeoutSeconds, ids...)
+}
+
+// WaitContext blocks until any of the listed processes is in a terminal state
+// (COMPLETED, FAILED, or CRASHED) and returns the ID of the first completed
+// process, in caller order. A listed ID already terminal when the call starts
+// is returned immediately. If the deadline passes first, WaitContext returns
+// ("", nil) with no error; a listed ID with no record is an error.
+//
+// The loop re-runs List each tick, so terminal detection is the same liveness
+// scan as wackyproc list. On Linux it arms one pidfd per listed running PID
+// and falls back to the polling ramp when the kernel cannot deliver a wake;
+// ForcePollingFallbackForTest exercises that fallback deterministically.
+func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, ids ...string) (string, error) {
+	return waitSetContext(ctx, cwd, timeoutSeconds, false, ids...)
+}
+
+// WaitAllContext blocks until every listed process is in a terminal state and
+// returns the ID of the last completed process (the one that satisfied the
+// barrier). It returns ("", nil) if the deadline passes first.
+func WaitAllContext(ctx context.Context, cwd string, timeoutSeconds int, ids ...string) (string, error) {
+	return waitSetContext(ctx, cwd, timeoutSeconds, true, ids...)
+}
+
+// waitSetContext is the shared loop behind WaitContext (first completed) and
+// WaitAllContext (barrier).
+func waitSetContext(ctx context.Context, cwd string, timeoutSeconds int, all bool, ids ...string) (string, error) {
+	if len(ids) == 0 {
+		return "", fmt.Errorf("wait requires at least one process ID")
 	}
-
-	timeoutSeconds = clampWaitSeconds(timeoutSeconds)
-
-	if hasTarget {
-		// An empty target has to be rejected here rather than falling through:
-		// filepath.Join drops the empty component, so the Stat below would resolve
-		// cwd/.proc, which exists once any process has run, and a bare --for would
-		// block until timeout instead of failing fast.
-		if target == "" {
-			return "", fmt.Errorf("process %q not found", target)
+	// Dedupe, preserving caller order.
+	seen := make(map[string]bool, len(ids))
+	set := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
 		}
-		procDir := filepath.Join(cwd, ProcDirName, target)
-		if _, err := os.Stat(procDir); os.IsNotExist(err) {
-			return "", fmt.Errorf("process %q not found", target)
-		}
+		seen[id] = true
+		set = append(set, id)
 	}
-
-	var baselineTerminal map[string]bool
-	if !hasTarget {
-		var err error
-		baselineTerminal, err = buildBaselineTerminal(cwd)
-		if err != nil {
-			return "", err
+	// A missing ID has to be rejected here rather than falling through:
+	// filepath.Join drops empty components, so an empty ID would resolve to the
+	// .proc directory itself - which exists once any process has run - and a
+	// wait with nothing named would block the full timeout instead of failing
+	// fast.
+	procBaseDir := filepath.Join(cwd, ProcDirName)
+	for _, id := range set {
+		if _, err := os.Stat(filepath.Join(procBaseDir, id)); os.IsNotExist(err) {
+			return "", fmt.Errorf("process %q not found", id)
 		}
 	}
 
 	var pidfdTried bool
-	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
+	// pendingWake is set after a pidfd wake or a reaped-pid ESRCH: a process is
+	// dead but the supervisor may not have written exit_code yet (CheckLiveness
+	// still reports RUNNING in that window). While pendingWake, the loop
+	// re-checks at a fast 5ms cadence instead of the ramp, so marker detection
+	// is bounded by the supervisor write, not by a full tick.
+	var pendingWake bool
+	deadline := time.Now().Add(time.Duration(clampWaitSeconds(timeoutSeconds)) * time.Second)
 	intervalMs := waitPollIntervalMs(0)
 	ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	polls := 0
+	lastCompleted := ""
+	prevTerminal := map[string]bool{}
 
 	for {
 		list, err := List(cwd)
 		if err != nil {
 			return "", err
 		}
-
-		if id, done, err := findTerminalProcess(cwd, list, hasTarget, target, baselineTerminal); err != nil {
+		terminal, err := findCompleted(list, set)
+		if err != nil {
 			return "", err
-		} else if done {
-			return id, nil
+		}
+		for _, id := range set {
+			if terminal[id] && !prevTerminal[id] {
+				lastCompleted = id
+			}
+		}
+		prevTerminal = terminal
+		if !all {
+			if lastCompleted != "" {
+				return lastCompleted, nil
+			}
+		} else {
+			allTerminal := true
+			for _, id := range set {
+				if !terminal[id] {
+					allTerminal = false
+					break
+				}
+			}
+			if allTerminal {
+				if lastCompleted == "" {
+					// Every listed ID was already terminal at call start: report the
+					// last one in caller order so the contract always returns an ID.
+					lastCompleted = set[len(set)-1]
+				}
+				return lastCompleted, nil
+			}
 		}
 
 		if time.Now().After(deadline) {
 			return "", nil
 		}
 
-		// pidfd fast path (Linux): arm one pidfd per eligible running process and block
-		// until one exits or the deadline passes. Zero polling CPU and zero detection
-		// latency; the kernel wakes us exactly when the process exits. Falls back to the
-		// polling ramp on unsupported kernels / sandboxes / non-Linux. A wake is not a
-		// verdict - the loop re-runs List + findTerminalProcess, so the #13 zombie gate
-		// (CheckLiveness -> isZombie / pid-reuse detection) still composes.
-		// Try the pidfd path on the first successful arm only; once it fails for any
-		// reason (unsupported kernel, sandbox EPERM, process-gone ESRCH) fall back to
-		// the polling ramp for the rest of this wait rather than re-syscalling per tick.
+		// pidfd fast path (Linux): arm one pidfd per listed running process and
+		// block until one exits or the deadline passes. Zero polling CPU and zero
+		// detection latency; the kernel wakes us exactly when a process exits.
+		// Falls back to the polling ramp on unsupported kernels / sandboxes /
+		// non-Linux. A wake is not a verdict - the loop re-runs List +
+		// findCompleted, so the #13 zombie gate (CheckLiveness -> isZombie /
+		// pid-reuse detection) still composes.
+		// Try the pidfd path on the first successful arm only; once it fails for
+		// any reason (unsupported kernel, sandbox EPERM, process-gone ESRCH) fall
+		// back to the polling ramp for the rest of this wait rather than
+		// re-syscalling per tick.
 		if !pidfdTried && !ForcePollingFallbackForTest {
-			pids, anyNonTerminal := eligibleRunningPids(list, hasTarget, target, baselineTerminal)
+			pids, anyPending := runningPidsFor(list, set, terminal)
 			if len(pids) > 0 {
 				remaining := time.Until(deadline)
 				woke, _, perr := waitPidFDsContext(ctx, pids, remaining)
 				if perr != nil {
 					if errors.Is(perr, ErrPidFDProcessGone) {
-						// pidfd_open raced the reap: the process is gone (ESRCH). Re-list
-						// immediately - findTerminalProcess + CheckLiveness decide now.
+						// pidfd_open raced the reap: a process is gone (ESRCH). Do not
+						// re-arm pidfd (a dead pid would ESRCH-loop); fall to the fast
+						// pendingWake re-check until the supervisor writes exit_code.
+						pidfdTried = true
+						pendingWake = true
 						continue
 					}
 					pidfdTried = true
 				} else if woke {
+					// A listed process exited (pidfd fired): re-list and let
+					// findCompleted + CheckLiveness confirm the terminal state
+					// (zombie / reap edge cases). Disable pidfd for the rest of this
+					// wait: re-arming a dead (possibly zombie) pid would just wake
+					// immediately again and spin while the supervisor asynchronously
+					// writes exit_code. pendingWake drops the ticker to 5ms until the
+					// marker lands.
+					pidfdTried = true
+					pendingWake = true
 					continue
 				} else {
 					return "", nil
 				}
-			} else if anyNonTerminal {
-				// Non-terminal record(s) exist but no pid is recorded yet (still spawning):
-				// re-list immediately so a fast-exiting process is caught on this cycle,
-				// not after a full 100ms tick.
+			} else if anyPending {
+				// Non-terminal record(s) exist but no PID is recorded yet (still
+				// spawning): re-list immediately so a fast-exiting process is caught
+				// on this cycle, not after a full 100ms tick.
 				continue
 			}
 		}
 
 		polls++
-		if iv := waitPollIntervalMs(polls); iv != intervalMs {
+		iv := waitPollIntervalMs(polls)
+		if pendingWake && iv > 5 {
+			iv = 5
+		}
+		if iv != intervalMs {
 			intervalMs = iv
 			ticker.Reset(time.Duration(iv) * time.Millisecond)
 		}
@@ -991,7 +925,7 @@ func Kill(cwd string, procID string) error {
 	return Signal(cwd, procID, syscall.SIGKILL)
 }
 
-// Prune disposes ALL terminal (COMPLETED, FAILED, CRASHED) process records regardless of consumed state.
+// Prune disposes ALL terminal (COMPLETED, FAILED, CRASHED) process records regardless of any other state.
 // Reports each removed process ID and tool to report. RUNNING processes are untouched.
 // If .proc/ does not exist or has no terminal records, Prune is a clean no-op.
 func Prune(cwd string, report io.Writer) error {
@@ -1035,49 +969,7 @@ func Prune(cwd string, report io.Writer) error {
 	return nil
 }
 
-// Unconsume clears the ConsumedSeq of a process record.
-// If procID does not exist, returns the standard 'process %q not found' error.
-// Works on running records too (clears preemptively).
-func Unconsume(cwd string, procID string) error {
-	procDir := filepath.Join(cwd, ProcDirName, procID)
-	if _, err := os.Stat(procDir); os.IsNotExist(err) {
-		return fmt.Errorf("process %q not found", procID)
-	}
-
-	metaPath := filepath.Join(procDir, MetaFileName)
-	metaBytes, err := os.ReadFile(metaPath)
-	if err != nil {
-		return fmt.Errorf("failed to read %s for process %q: %w", MetaFileName, procID, err)
-	}
-
-	var meta Meta
-	if err := json.Unmarshal(metaBytes, &meta); err != nil {
-		return fmt.Errorf("failed to parse %s for process %q: %w", MetaFileName, procID, err)
-	}
-
-	meta.ConsumedSeq = 0
-
-	updatedBytes, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to serialize %s: %w", MetaFileName, err)
-	}
-
-	tmpPath := filepath.Join(procDir, fmt.Sprintf("meta.json.tmp.%d", time.Now().UnixNano()))
-	if err := os.WriteFile(tmpPath, updatedBytes, 0644); err != nil {
-		return fmt.Errorf("failed to write temporary %s: %w", MetaFileName, err)
-	}
-	if err := os.Rename(tmpPath, metaPath); err != nil {
-		// Best-effort cleanup: remove temporary meta file after rename failure to prevent tmp accumulation;
-		// failure to remove does not supersede returning the rename error.
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("failed to update %s: %w", MetaFileName, err)
-	}
-
-	return nil
-}
-
-// Remove force-disposes a process record regardless of status or consumed state. This is
-// the escape hatch for stuck RUNNING records: a process that died (or hung) outside the
+// Remove force-disposes a process record regardless of status. This is // the escape hatch for stuck RUNNING records: a process that died (or hung) outside the
 // supervisor's capture window leaves no exit, so prune - which only touches terminal
 // records - can never clear it. The process itself is NOT signaled: if it is still alive
 // it keeps running unmanaged, so stop or kill it first if you want it gone. The record's
