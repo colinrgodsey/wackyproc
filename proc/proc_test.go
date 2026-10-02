@@ -1475,7 +1475,9 @@ func TestDisposal_RunAndListWarning(t *testing.T) {
 		t.Errorf("expected running record r001 to be preserved, but it was deleted")
 	}
 
-	// 2. Cap exceeded and zero consumed terminals: nothing is disposed and List prints single stderr warning
+	// 2. Cap exceeded with zero consumed terminals: List now self-heals under the overflow
+	// policy - it evicts the oldest unconsumed records down to the cap (logging each
+	// disposal) instead of warning "0 disposable" forever.
 	cwd2 := setupTestEnv(t)
 	createExecutable(t, cwd2, "quick-tool", "echo 1")
 
@@ -1505,16 +1507,23 @@ func TestDisposal_RunAndListWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proc.List failed: %v", err)
 	}
-	if len(list) != 105 {
-		t.Errorf("expected 105 records in list, got %d", len(list))
+	if len(list) != 100 {
+		t.Errorf("expected 100 records in list (cap enforced), got %d", len(list))
 	}
-
+	// The oldest 5 unconsumed records (x001..x005) were evicted.
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("x%03d", i)
+		if _, err := os.Stat(filepath.Join(cwd2, proc.ProcDirName, id)); !os.IsNotExist(err) {
+			t.Errorf("expected unconsumed record %s to be evicted under cap, but it still exists", id)
+		}
+	}
+	// No "0 disposable" warning: each eviction is logged instead.
 	stderrOut := stderrBuf.String()
-	if !strings.Contains(stderrOut, "105 terminal process records exceed cap of 100 with 0 disposable") {
-		t.Errorf("expected warning in stderr naming both counts, got: %q", stderrOut)
+	if strings.Contains(stderrOut, "with 0 disposable") {
+		t.Errorf("expected no '0 disposable' warning under the overflow policy, got: %q", stderrOut)
 	}
-	if !strings.Contains(stderrOut, "wackyproc prune") {
-		t.Errorf("expected warning to suggest 'wackyproc prune', got: %q", stderrOut)
+	if !strings.Contains(stderrOut, "disposed terminal record x001 (cap 100)") {
+		t.Errorf("expected disposal log naming the first evicted record, got: %q", stderrOut)
 	}
 }
 
@@ -1983,5 +1992,57 @@ func TestWait_ShortTaskLatency(t *testing.T) {
 	}
 	if elapsed > 1500*time.Millisecond {
 		t.Errorf("short-task latency regressed: Wait took %v for a 200ms task (polling ramp broken?)", elapsed)
+	}
+}
+
+// TestDisposal_WarningRetainedWhenEvictionImpossible covers the overflow-policy escape:
+// when disposal cannot bring the count under cap (removal fails), List must RETAIN the
+// warning (card acceptance: "The warning appears only when disposal cannot reach the
+// cap"). The test forces removal failure via ForceRemovalBlockedForTest - deterministic
+// on any platform, no filesystem-permission fighting.
+func TestDisposal_WarningRetainedWhenEvictionImpossible(t *testing.T) {
+	proc.ForceRemovalBlockedForTest = true
+	defer func() { proc.ForceRemovalBlockedForTest = false }()
+
+	cwd := setupTestEnv(t)
+	procBaseDir := filepath.Join(cwd, proc.ProcDirName)
+	_ = os.MkdirAll(procBaseDir, 0755)
+
+	// 105 unconsumed terminal records - exceeds cap by 5.
+	for i := 1; i <= 105; i++ {
+		id := fmt.Sprintf("w%03d", i)
+		seedProcessRecord(t, cwd, id, "tool-unconsumed", proc.StatusCompleted, uint64(i), 0)
+	}
+
+	// Capture stderr around proc.List. Eviction is blocked by the hook, so the cap
+	// cannot self-heal and the warning must fire.
+	oldStderr := os.Stderr
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = wPipe
+
+	list, err := proc.List(cwd)
+
+	_ = wPipe.Close()
+	os.Stderr = oldStderr
+
+	var stderrBuf bytes.Buffer
+	_, _ = io.Copy(&stderrBuf, rPipe)
+	_ = rPipe.Close()
+
+	if err != nil {
+		t.Fatalf("proc.List: %v", err)
+	}
+	if len(list) != 105 {
+		t.Errorf("expected 105 records (eviction blocked), got %d", len(list))
+	}
+	stderrOut := stderrBuf.String()
+	if !strings.Contains(stderrOut, "still exceed cap of 100 (disposal failed)") {
+		t.Errorf("expected retained warning when eviction is impossible, got: %q", stderrOut)
+	}
+	if !strings.Contains(stderrOut, "wackyproc prune") {
+		t.Errorf("expected warning to suggest prune, got: %q", stderrOut)
 	}
 }

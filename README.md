@@ -29,7 +29,7 @@ In turn-based agent runtimes (like [wackypub](https://github.com/colinrgodsey/wa
 
 ## Consumption semantics and status taxonomy
 
-Each record carries a consumed sequence number. `get` on a terminal record marks it consumed; `peek` never does; `unconsume` clears it. Terminal records are retained up to a cap (`MaxTerminalEntries = 100`, deliberately below the 300-entry scratchpad cap since records carry captured output) — `unconsume` preserves a record from auto-disposal, `prune` disposes terminal records regardless.
+Each record carries a consumed sequence number. `get` on a terminal record marks it consumed; `peek` never does; `unconsume` clears it. Terminal records are retained up to a cap (`MaxTerminalEntries = 100`, deliberately below the 300-entry scratchpad cap since records carry captured output). When the cap overflows, the oldest terminal records are auto-disposed (consumed-first, then unconsumed-oldest) with each disposal logged to stderr - the cap self-heals on every `list`/`run`; `unconsume` only DEPRIORITIZES a record (consumed records are evicted before unconsumed ones) — over the cap there is no retention guarantee, so `get` output promptly or `prune` deliberately. `prune` disposes terminal records regardless.
 `remove` disposes a specific record in any state. Every disposal path records the ID in a disposed list, and ID generation never re-claims a disposed ID, so a fresh dispatch cannot inherit an ID that logs still reference from the previous record.
 
 Status is derived from liveness plus exit code, never stored:

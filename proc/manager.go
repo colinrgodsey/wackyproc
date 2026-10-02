@@ -235,8 +235,8 @@ func Run(cwd string, toolName string, args []string, stdinReader io.Reader) (str
 		return "", err
 	}
 
-	// Post-spawn disposal of consumed terminal records exceeding cap (D79)
-	disposeConsumedTerminals(procBaseDir)
+	// Post-spawn cap enforcement: evict the oldest terminal records when over cap.
+	_ = enforceTerminalCap(procBaseDir)
 
 	return procID, nil
 }
@@ -294,72 +294,98 @@ func Describe(cwd string, procID string) (*DescribeInfo, error) {
 	}, nil
 }
 
-// disposeConsumedTerminals disposes consumed terminal records in ascending Gen order
-// if the total terminal record count exceeds MaxTerminalEntries.
-// Unconsumed terminal records and RUNNING processes are NEVER auto-disposed.
-func disposeConsumedTerminals(procBaseDir string) {
+// enforceTerminalCap is the record-cap overflow policy (tasks/wackyproc/record-cap-overflow-policy):
+// when terminal records exceed MaxTerminalEntries, dispose the oldest terminal records until
+// at/under the cap - consumed OR unconsumed (the old disposeConsumedTerminals only evicted
+// consumed records, so an unconsumed pile could exceed the cap forever while List warned
+// "0 disposable" on every command). Disposals are logged to stderr so the eviction is
+// discoverable; consumers who want to preserve output should `get` records promptly.
+// Preference order: consumed-oldest first, then unconsumed-oldest - a record the operator
+// has already drained is cheaper to lose than one never read. Returns true if the count
+// is still over cap after disposal (removal errors), false if at/under cap.
+// ForceRemovalBlockedForTest is a test-only escape hatch: when true, enforceTerminalCap
+// treats every disposal as failing - simulating an eviction-impossible overflow (removal
+// errors) so the retained-warning path is testable on any platform without fighting
+// filesystem permissions.
+var ForceRemovalBlockedForTest bool
+
+func enforceTerminalCap(procBaseDir string) bool {
 	entries, err := os.ReadDir(procBaseDir)
 	if err != nil {
-		return
+		return false
 	}
 
-	var terminalCount int
-	var consumedTerminals []consumedTerminalRecord
+	type terminalRec struct {
+		id       string
+		gen      uint64
+		path     string
+		consumed bool
+	}
+	var terminals []terminalRec
 
 	for _, entry := range entries {
 		if !entry.IsDir() || !IsProcessRecordDir(entry.Name()) {
 			continue
 		}
 		procDir := filepath.Join(procBaseDir, entry.Name())
-		// Enumeration tolerates an unreadable record: skipping it is what lets a corrupt
-		// record still be pruned later instead of failing the whole scan.
 		meta, err := readMeta(procDir)
 		if err != nil {
 			continue
 		}
-
 		liveness, err := CheckLiveness(procDir, &meta)
 		if err != nil {
 			continue
 		}
 		if isTerminal(liveness.Status) {
-			terminalCount++
-			if meta.ConsumedSeq > 0 {
-				consumedTerminals = append(consumedTerminals, consumedTerminalRecord{
-					id:   meta.ID,
-					gen:  meta.Gen,
-					path: procDir,
-				})
-			}
+			terminals = append(terminals, terminalRec{
+				id:       meta.ID,
+				gen:      meta.Gen,
+				path:     procDir,
+				consumed: meta.ConsumedSeq > 0,
+			})
 		}
 	}
 
-	if terminalCount <= MaxTerminalEntries || len(consumedTerminals) == 0 {
-		return
+	if len(terminals) <= MaxTerminalEntries {
+		return false
 	}
 
-	// Sort consumed terminals by Gen ascending (lowest gen / oldest creation first)
-	sort.Slice(consumedTerminals, func(i, j int) bool {
-		return consumedTerminals[i].gen < consumedTerminals[j].gen
+	// Oldest first (Gen ascending); consumed records before unconsumed at equal cost.
+	sort.Slice(terminals, func(i, j int) bool {
+		if terminals[i].consumed != terminals[j].consumed {
+			return terminals[i].consumed
+		}
+		return terminals[i].gen < terminals[j].gen
 	})
 
-	for _, rec := range consumedTerminals {
-		if terminalCount <= MaxTerminalEntries {
+	over := len(terminals) - MaxTerminalEntries
+	for _, rec := range terminals {
+		if over <= 0 {
 			break
 		}
 		// Accepted race: another process may be reading this record while we remove it.
-		// Get already returns 'process "id" not found' when os.Stat fails or files disappear,
-		// so concurrent reads cleanly return not-found rather than crashing or returning partial output.
-		if err := os.RemoveAll(rec.path); err == nil {
-			recordDisposedID(procBaseDir, rec.id)
-			terminalCount--
+		// Get already returns 'process "id" not found' when the record disappears.
+		if !ForceRemovalBlockedForTest {
+			if err := os.RemoveAll(rec.path); err == nil {
+				fmt.Fprintf(os.Stderr, "disposed terminal record %s (cap %d)\n", rec.id, MaxTerminalEntries)
+				recordDisposedID(procBaseDir, rec.id)
+				over--
+			}
 		}
 	}
+	return over > 0
 }
 
 // List inspects all process directories in <cwd>/.proc/ and returns their status.
 func List(cwd string) ([]ProcessInfo, error) {
 	procBaseDir := filepath.Join(cwd, ProcDirName)
+	// Overflow policy (tasks/wackyproc/record-cap-overflow-policy): the cap self-heals
+	// on every status read - if terminal records exceed MaxTerminalEntries, evict the
+	// oldest (logging each disposal) BEFORE taking the directory snapshot below, so a
+	// disposed record cannot still appear in this call's results. The warning later only
+	// fires if disposal failed to bring the count under cap, instead of repeating
+	// "0 disposable" forever.
+	_ = enforceTerminalCap(procBaseDir)
 	entries, err := os.ReadDir(procBaseDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -413,8 +439,8 @@ func List(cwd string) ([]ProcessInfo, error) {
 		})
 	}
 
-	if terminalCount > MaxTerminalEntries && consumedTerminalCount == 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d terminal process records exceed cap of %d with 0 disposable; run 'wackyproc prune' to clear\n", terminalCount, MaxTerminalEntries)
+	if terminalCount > MaxTerminalEntries {
+		fmt.Fprintf(os.Stderr, "warning: %d terminal process records still exceed cap of %d (disposal failed); run 'wackyproc prune' to clear\n", terminalCount, MaxTerminalEntries)
 	}
 
 	sort.Slice(results, func(i, j int) bool {
