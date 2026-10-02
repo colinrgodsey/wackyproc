@@ -701,6 +701,11 @@ func waitPollIntervalMs(pollsSoFar int) int {
 	return iv
 }
 
+// ForcePollingFallbackForTest is a test-only escape hatch: when true, Wait skips the
+// pidfd fast path and uses the polling ramp fallback even on Linux where pidfd is
+// supported. Lets the fallback be exercised deterministically on any platform.
+var ForcePollingFallbackForTest bool
+
 // Wait is the context-less wrapper over WaitContext.
 func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 	return WaitContext(context.Background(), cwd, timeoutSeconds, targetID...)
@@ -745,6 +750,12 @@ func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, targetID .
 	}
 
 	var pidfdTried bool
+	// pendingWake is set after a pidfd wake or a reaped-pid ESRCH: the process is
+	// dead but the supervisor may not have written exit_code yet (CheckLiveness still
+	// reports RUNNING in that window). While pendingWake, the loop re-checks at a
+	// fast 5ms cadence instead of the 100ms ramp, so marker detection is bounded by
+	// the supervisor write, not by a full tick.
+	var pendingWake bool
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
 	intervalMs := waitPollIntervalMs(0)
 	ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
@@ -777,19 +788,30 @@ func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, targetID .
 		// Try the pidfd path on the first successful arm only; once it fails for any
 		// reason (unsupported kernel, sandbox EPERM, process-gone ESRCH) fall back to
 		// the polling ramp for the rest of this wait rather than re-syscalling per tick.
-		if !pidfdTried {
+		if !pidfdTried && !ForcePollingFallbackForTest {
 			pids, anyNonTerminal := eligibleRunningPids(list, hasTarget, target, baselineTerminal)
 			if len(pids) > 0 {
 				remaining := time.Until(deadline)
 				woke, _, perr := waitPidFDsContext(ctx, pids, remaining)
 				if perr != nil {
 					if errors.Is(perr, ErrPidFDProcessGone) {
-						// pidfd_open raced the reap: the process is gone (ESRCH). Re-list
-						// immediately - findTerminalProcess + CheckLiveness decide now.
+						// pidfd_open raced the reap: the process is gone (ESRCH). Do not
+						// re-arm pidfd (a dead pid would ESRCH-loop); fall to the fast
+						// pendingWake re-check until the supervisor writes exit_code.
+						pidfdTried = true
+						pendingWake = true
 						continue
 					}
 					pidfdTried = true
 				} else if woke {
+					// Process exited (pidfd fired): re-list and let findTerminalProcess +
+					// CheckLiveness confirm the terminal state (zombie / reap edge cases).
+					// Disable pidfd for the rest of this wait: re-arming the dead (possibly
+					// zombie) pid would just wake immediately again and spin while the
+					// supervisor asynchronously writes exit_code. pendingWake drops the
+					// ticker to 5ms until the marker lands.
+					pidfdTried = true
+					pendingWake = true
 					continue
 				} else {
 					return "", nil
@@ -803,7 +825,11 @@ func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, targetID .
 		}
 
 		polls++
-		if iv := waitPollIntervalMs(polls); iv != intervalMs {
+		iv := waitPollIntervalMs(polls)
+		if pendingWake && iv > 5 {
+			iv = 5
+		}
+		if iv != intervalMs {
 			intervalMs = iv
 			ticker.Reset(time.Duration(iv) * time.Millisecond)
 		}
