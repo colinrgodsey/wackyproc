@@ -709,9 +709,9 @@ func Wait(cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 // WaitContext blocks up to timeoutSeconds for a background process to reach a terminal
 // state, honoring ctx cancellation: if the ctx is cancelled (e.g. an agent turn cancel
 // downstream-cancels the tool running wackyproc wait), both the pidfd poll and the
-// polling ticker abort promptly and the ctx error is returned. The pidfd path races
-// the cancel by running poll in a goroutine and closing the fds on cancel (which
-// unblocks poll); the ticker path selects on ctx.Done().
+// polling ticker abort promptly and the ctx error is returned. The pidfd path polls
+// in bounded slices (100ms) and checks ctx.Done() between them, so a cancel is
+// observed within one slice in the worst case; the ticker path selects on ctx.Done().
 func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, targetID ...string) (string, error) {
 	var target string
 	hasTarget := len(targetID) > 0
