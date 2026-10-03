@@ -27,16 +27,14 @@ func TestMain(m *testing.M) {
 // resetWaitFlags clears cobra's package-level flag state between CLI tests.
 //
 // rootCmd and waitCmd are process-global singletons and pflag never resets
-// Flag.Changed, so any test that passes --for leaves the flag marked as set for
-// every later Execute() in the same test binary, with waitFor retaining its
-// stale value. Without this call, a bare-mode test added after a --for test
-// would silently take the targeted branch and fail on a "process not found"
-// error unrelated to what it is testing.
+// Flag.Changed, so any test that passes --all leaves the flag marked as set for
+// every later Execute() in the same test binary, with allWait retaining its
+// stale value. Without this call, a first-completed test added after a --all
+// test would silently take the barrier branch and fail on an error unrelated to
+// what it is testing.
 // Calling it clears incoming state and registers the same reset to run again on
 // exit, so every CLI test both starts and ends clean no matter where a future
-// test is inserted or how -shuffle orders them. Doing this only at the start of
-// the two --for tests would leave the hazard open for any test that copies the
-// bare-mode test below as its template and never learns the convention exists.
+// test is inserted or how -shuffle orders them.
 func resetWaitFlags(t *testing.T) {
 	t.Helper()
 	clearWaitFlagState()
@@ -44,10 +42,10 @@ func resetWaitFlags(t *testing.T) {
 }
 
 func clearWaitFlagState() {
-	if f := waitCmd.Flags().Lookup("for"); f != nil {
+	if f := waitCmd.Flags().Lookup("all"); f != nil {
 		f.Changed = false
 	}
-	waitFor = ""
+	allWait = false
 	rootCmd.SetOut(os.Stdout)
 	rootCmd.SetErr(os.Stderr)
 }
@@ -56,6 +54,15 @@ func TestWaitCmd_CLI_PositionalAsTimeout(t *testing.T) {
 	resetWaitFlags(t)
 
 	tmpDir := t.TempDir()
+	toolsDir := filepath.Join(tmpDir, proc.ToolsDirName)
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("failed to create tools dir: %v", err)
+	}
+	scriptPath := filepath.Join(toolsDir, "quick-cli")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("failed to write quick-cli: %v", err)
+	}
+
 	origCwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("failed to get cwd: %v", err)
@@ -65,42 +72,14 @@ func TestWaitCmd_CLI_PositionalAsTimeout(t *testing.T) {
 	}
 	defer os.Chdir(origCwd)
 
-	// wackyproc wait 1 (1 second) with no tracked processes: nothing is eligible, so
-	// the wait is a no-op and must return immediately with success (Colin 2026-09-20).
-	rootCmd.SetArgs([]string{"wait", "1"})
-
-	start := time.Now()
-	err = rootCmd.Execute()
-	elapsed := time.Since(start)
+	id, err := proc.Run(tmpDir, "quick-cli", nil, nil)
 	if err != nil {
-		t.Fatalf("expected nil error for no-op wait, got %v", err)
+		t.Fatalf("proc.Run failed: %v", err)
 	}
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("expected immediate no-op wait, took %v", elapsed)
-	}
-}
 
-// TestWaitCmd_CLI_NothingEligible_ReturnsImmediately pins acceptance 1+2 at the CLI:
-// any-mode wait with zero running processes prints a no-op message and exits 0
-// (redirected: wackyproc wait times out on a waiting turn, so the no-op return is
-// the contract callers rely on), rather than blocking the full timeout.
-func TestWaitCmd_CLI_NothingEligible_ReturnsImmediately(t *testing.T) {
-	resetWaitFlags(t)
-
-	tmpDir := t.TempDir()
-	origCwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get cwd: %v", err)
-	}
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("failed to chdir to tmpDir: %v", err)
-	}
-	defer os.Chdir(origCwd)
-
-	rootCmd.SetArgs([]string{"wait", "600"})
-
-	// The no-op message is written via fmt.Println to os.Stdout (same as the normal
-	// completed-ID print), so capture os.Stdout like TestWaitCmd_CLI_Success does.
+	// "wait 1 <id>": the all-digit first argument must parse as the timeout
+	// (seconds), not as a process ID. The record reaches terminal state fast, so
+	// the wait returns it well inside the 1s window.
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("os.Pipe failed: %v", err)
@@ -109,26 +88,23 @@ func TestWaitCmd_CLI_NothingEligible_ReturnsImmediately(t *testing.T) {
 	os.Stdout = w
 	defer func() { os.Stdout = origStdout }()
 
-	start := time.Now()
-	err = rootCmd.Execute()
-	elapsed := time.Since(start)
+	rootCmd.SetArgs([]string{"wait", "1", id})
+	execErr := rootCmd.Execute()
 
 	w.Close()
 
 	var outBuf bytes.Buffer
 	_, _ = io.Copy(&outBuf, r)
 
-	if err != nil {
-		t.Fatalf("expected nil error for no-op wait, got %v", err)
+	if execErr != nil {
+		t.Fatalf("rootCmd.Execute failed: %v", execErr)
 	}
-	if !strings.Contains(outBuf.String(), "nothing to wait for") {
-		t.Errorf("expected stdout to contain \"nothing to wait for\", got %q", outBuf.String())
-	}
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("expected immediate no-op wait, took %v", elapsed)
+	if !strings.Contains(outBuf.String(), id) {
+		t.Errorf("expected stdout to contain %q, got %q", id, outBuf.String())
 	}
 }
-func TestWaitCmd_CLI_ForUnknownID_FailsImmediately(t *testing.T) {
+
+func TestWaitCmd_CLI_UnknownID_FailsImmediately(t *testing.T) {
 	resetWaitFlags(t)
 
 	tmpDir := t.TempDir()
@@ -144,7 +120,7 @@ func TestWaitCmd_CLI_ForUnknownID_FailsImmediately(t *testing.T) {
 	var stdoutBuf, stderrBuf bytes.Buffer
 	rootCmd.SetOut(&stdoutBuf)
 	rootCmd.SetErr(&stderrBuf)
-	rootCmd.SetArgs([]string{"wait", "--for", "zz99", "5"})
+	rootCmd.SetArgs([]string{"wait", "5", "zz99"})
 
 	start := time.Now()
 	err = rootCmd.Execute()
@@ -198,7 +174,7 @@ func TestWaitCmd_CLI_Success(t *testing.T) {
 	os.Stdout = w
 	defer func() { os.Stdout = origStdout }()
 
-	rootCmd.SetArgs([]string{"wait", "--for", id, "5"})
+	rootCmd.SetArgs([]string{"wait", "5", id})
 	execErr := rootCmd.Execute()
 
 	w.Close()
@@ -228,8 +204,8 @@ func TestWaitCmd_CLI_NegativeTimeout(t *testing.T) {
 			expectError: "wait: timeout must be a non-negative integer (got -5)",
 		},
 		{
-			name:        "targeted negative timeout",
-			args:        []string{"wait", "--for", "anyid", "-5"},
+			name:        "negative timeout before an id",
+			args:        []string{"wait", "-5", "anyid"},
 			expectError: "wait: timeout must be a non-negative integer (got -5)",
 		},
 		{
@@ -298,7 +274,7 @@ func TestWaitCmd_CLI_ZeroTimeout_Succeeds(t *testing.T) {
 	os.Stdout = w
 	defer func() { os.Stdout = origStdout }()
 
-	rootCmd.SetArgs([]string{"wait", "0"})
+	rootCmd.SetArgs([]string{"wait", "0", id})
 	execErr := rootCmd.Execute()
 
 	w.Close()
@@ -399,7 +375,7 @@ func TestPeekCmd_CLI_Execution(t *testing.T) {
 	}
 
 	// Wait for process to complete
-	if _, err := proc.Wait(tmpDir, 5); err != nil {
+	if _, err := proc.Wait(tmpDir, 5, id); err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
 
@@ -491,7 +467,7 @@ func TestPruneCmd_CLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proc.Run failed: %v", err)
 	}
-	_, _ = proc.Wait(tmpDir, 5)
+	_, _ = proc.Wait(tmpDir, 5, id)
 
 	// 1. Happy path: prune with no args
 	r, w, err := os.Pipe()
@@ -527,72 +503,6 @@ func TestPruneCmd_CLI(t *testing.T) {
 	}
 }
 
-func TestUnconsumeCmd_CLI(t *testing.T) {
-	tmpDir := t.TempDir()
-	toolsDir := filepath.Join(tmpDir, proc.ToolsDirName)
-	if err := os.MkdirAll(toolsDir, 0755); err != nil {
-		t.Fatalf("failed to create tools dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(toolsDir, "tool-u"), []byte("#!/bin/sh\necho done\n"), 0755); err != nil {
-		t.Fatalf("failed to write tool: %v", err)
-	}
-
-	origCwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("failed to get cwd: %v", err)
-	}
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("failed to chdir to tmpDir: %v", err)
-	}
-	defer os.Chdir(origCwd)
-
-	id, err := proc.Run(tmpDir, "tool-u", nil, nil)
-	if err != nil {
-		t.Fatalf("proc.Run failed: %v", err)
-	}
-	_, _ = proc.Wait(tmpDir, 5)
-
-	var stdoutBuf, stderrBuf bytes.Buffer
-	if err := proc.Get(tmpDir, id, &stdoutBuf, &stderrBuf); err != nil {
-		t.Fatalf("proc.Get failed: %v", err)
-	}
-
-	metaPath := filepath.Join(tmpDir, proc.ProcDirName, id, proc.MetaFileName)
-	metaBytes, _ := os.ReadFile(metaPath)
-	if !strings.Contains(string(metaBytes), "consumed_seq") {
-		t.Fatalf("expected consumed_seq after get, got: %s", string(metaBytes))
-	}
-
-	// 1. Happy path: unconsume <id>
-	rootCmd.SetArgs([]string{"unconsume", id})
-	execErr := rootCmd.Execute()
-	if execErr != nil {
-		t.Fatalf("unconsume failed: %v", execErr)
-	}
-
-	metaBytes, _ = os.ReadFile(metaPath)
-	if strings.Contains(string(metaBytes), "consumed_seq") {
-		t.Errorf("expected consumed_seq to be removed after unconsume, got: %s", string(metaBytes))
-	}
-
-	// 2. Unknown ID
-	rootCmd.SetArgs([]string{"unconsume", "zz99"})
-	err = rootCmd.Execute()
-	if err == nil {
-		t.Fatalf("expected error for unknown ID, got nil")
-	}
-	if !strings.Contains(err.Error(), `process "zz99" not found`) {
-		t.Errorf("expected 'process \"zz99\" not found', got: %v", err)
-	}
-
-	// 3. Missing arg (ExactArgs(1))
-	rootCmd.SetArgs([]string{"unconsume"})
-	err = rootCmd.Execute()
-	if err == nil {
-		t.Errorf("expected error with 0 args, got nil")
-	}
-}
-
 func TestDescribeCmd_CLI(t *testing.T) {
 	tmpDir := t.TempDir()
 	origCwd, err := os.Getwd()
@@ -618,7 +528,7 @@ func TestDescribeCmd_CLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proc.Run: %v", err)
 	}
-	if _, err := proc.Wait(tmpDir, 5); err != nil {
+	if _, err := proc.Wait(tmpDir, 5, id); err != nil {
 		t.Fatalf("proc.Wait: %v", err)
 	}
 
@@ -661,9 +571,6 @@ func TestDescribeCmd_CLI(t *testing.T) {
 	}
 	if _, hasArgs := infos[0]["args"]; !hasArgs {
 		t.Errorf("describe json missing args key: %v", infos[0])
-	}
-	if consumed, _ := infos[0]["consumed"].(bool); consumed {
-		t.Errorf("describe json reported consumed=true after no get")
 	}
 
 	// 3. list --json stays compact (no args) even for this big-arg record.
@@ -718,7 +625,7 @@ func TestDescribeCmd_CLI_MultiID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proc.Run mt-two: %v", err)
 	}
-	if _, err := proc.Wait(tmpDir, 5); err != nil {
+	if _, err := proc.WaitAll(tmpDir, 5, id1, id2); err != nil {
 		t.Fatalf("proc.Wait: %v", err)
 	}
 

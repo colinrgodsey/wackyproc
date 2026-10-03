@@ -45,15 +45,14 @@ const (
 
 // Meta records metadata about a spawned background process.
 type Meta struct {
-	ID          string   `json:"id"`
-	Tool        string   `json:"tool"`
-	ToolPath    string   `json:"tool_path"`
-	Args        []string `json:"args"`
-	Cwd         string   `json:"cwd"`
-	StartedAt   int64    `json:"started_at"`
-	StartTime   string   `json:"start_time,omitempty"`
-	Gen         uint64   `json:"gen"`
-	ConsumedSeq uint64   `json:"consumed_seq,omitempty"`
+	ID        string   `json:"id"`
+	Tool      string   `json:"tool"`
+	ToolPath  string   `json:"tool_path"`
+	Args      []string `json:"args"`
+	Cwd       string   `json:"cwd"`
+	StartedAt int64    `json:"started_at"`
+	StartTime string   `json:"start_time,omitempty"`
+	Gen       uint64   `json:"gen"`
 }
 
 // ProcessInfo represents the user-visible status of a process. Args is deliberately
@@ -73,7 +72,7 @@ type ProcessInfo struct {
 
 // DescribeInfo is the full-detail view of ONE process record, served by Describe and the
 // wackyproc describe command. Unlike ProcessInfo it carries the complete Args plus the
-// surrounding metadata (cwd, tool path, output locations, consumed state).
+// surrounding metadata (cwd, tool path, output locations).
 type DescribeInfo struct {
 	ID         string   `json:"id"`
 	Tool       string   `json:"tool"`
@@ -85,7 +84,6 @@ type DescribeInfo struct {
 	PGID       int      `json:"pgid,omitempty"`
 	ExitCode   *int     `json:"exit_code,omitempty"`
 	StartedAt  int64    `json:"started_at"`
-	Consumed   bool     `json:"consumed"`
 	StdoutFile string   `json:"stdout_file"`
 	StderrFile string   `json:"stderr_file"`
 	StdinFile  string   `json:"stdin_file,omitempty"`

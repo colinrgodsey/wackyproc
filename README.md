@@ -16,20 +16,18 @@ In turn-based agent runtimes (like [wackypub](https://github.com/colinrgodsey/wa
 
 - `wackyproc run <tool> [args...]`: Spawns `./tools/<tool>` as a detached background process and outputs its 8-character pronounceable slug ID (e.g. `katoruvo`). Stdin piped into `run` is drained into `.proc/<id>/stdin` before detaching.
 - `wackyproc list [--json]`: Lists all tracked processes (`ID STATUS TOOL PID EXIT`) and their current status (`RUNNING`, `COMPLETED`, `FAILED`, `CRASHED`). `--json` is COMPACT by contract: it returns only the table fields plus timestamps (id, tool, status, pid, pgid, exit_code, started_at) and deliberately EXCLUDES command args - a dispatch's args can be multi-KB (agent prompts), and list is the status snapshot; use `describe` for full args.
-- `wackyproc describe <proc_id> [more ids...] [--json]`: Full detail for one or more records - complete command args, cwd, tool path, output-file locations, consumed state. Does not mark consumed.
-- `wackyproc wait [seconds]`: Blocks up to N seconds (default 500) until a process that was **still running when the call began** finishes. Processes already terminal at entry are never reported, and the call blocks to the timeout when there is nothing pending, exiting non-zero.
-- `wackyproc wait --for <proc_id> [seconds]`: Blocks until that specific process finishes, reporting it immediately if it is already terminal. Fails immediately if the ID does not exist.
-- `wackyproc get <proc_id>`: Dumps captured stdout and stderr to the terminal and marks terminal records as consumed (retrieval = consumption).
-- `wackyproc peek <proc_id> [--lines N]`: Shows the trailing N lines (default 20) of captured stdout/stderr without a full dump, and never marks the record as consumed (unlike `get`).
-- `wackyproc unconsume <proc_id>`: Clears the consumed sequence number of a process record, preserving it from auto-disposal.
-- `wackyproc prune`: Disposes all terminal process records regardless of consumed state and reports removed IDs.
-- `wackyproc remove <proc_id>`: Force-disposes a record regardless of status or consumed state - the escape hatch for stuck `RUNNING` records that `prune` can never clear (a process that died or hung outside the supervisor's capture window has no exit). The process is NOT signaled: if it is still alive it keeps running unmanaged, so stop or kill it first if you want it gone.
+- `wackyproc describe <proc_id> [more ids...] [--json]`: Full detail for one or more records - complete command args, cwd, tool path, output-file locations.
+- `wackyproc wait [seconds] <proc_id> [proc_id...] [--all]`: Blocks up to N seconds (default 500; the first argument is the timeout only when it is all digits, since record IDs are pronounceable slugs and never numeric) and returns the ID of the first listed process to reach a terminal state. A process already terminal at entry is returned immediately, and a listed ID that does not exist fails immediately. With `--all` the call is a barrier: it waits for every listed process and returns the last one to complete. A timeout exits non-zero without returning an ID.
+- `wackyproc get <proc_id>`: Dumps captured stdout and stderr to the terminal. It is a pure stream: it marks nothing, and a record whose `meta.json` has been disposed concurrently is reported as not found.
+- `wackyproc peek <proc_id> [--lines N]`: Shows the trailing N lines (default 20) of captured stdout/stderr without a full dump. Pure read: it writes no state.
+- `wackyproc prune`: Disposes all terminal process records and reports the removed IDs.
+- `wackyproc remove <proc_id>`: Force-disposes a record regardless of status - the escape hatch for stuck `RUNNING` records that `prune` can never clear (a process that died or hung outside the supervisor's capture window has no exit). The process is NOT signaled: if it is still alive it keeps running unmanaged, so stop or kill it first if you want it gone.
 - `wackyproc stop <proc_id> [--timeout N]`: Gracefully stops the whole process group via `SIGTERM`, falling back to `SIGKILL` after N seconds (default 3).
 - `wackyproc skill`: Prints the bundled agent skill guide (`skills/wackyproc/SKILL.md`, embedded in the binary).
 
-## Consumption semantics and status taxonomy
+## Record retention and status taxonomy
 
-Each record carries a consumed sequence number. `get` on a terminal record marks it consumed; `peek` never does; `unconsume` clears it. Terminal records are retained up to a cap (`MaxTerminalEntries = 100`, deliberately below the 300-entry scratchpad cap since records carry captured output) — `unconsume` preserves a record from auto-disposal, `prune` disposes terminal records regardless.
+Records carry no consumed state: `get` and `peek` are pure streams, and a record's output may be read any number of times without affecting its lifetime. Terminal records are auto-retired when their count exceeds the cap (`MaxTerminalEntries = 100`, deliberately below the 300-entry scratchpad cap since records carry captured output). Retirement is age-based - the oldest `Gen` goes first, regardless of whether the output was ever read - and runs at both growth points: every `run` and every `list` (before the snapshot, so a record the cap is about to drop never appears in that call's results). Each retirement is logged to stderr; `prune` disposes terminal records on demand.
 `remove` disposes a specific record in any state. Every disposal path records the ID in a disposed list, and ID generation never re-claims a disposed ID, so a fresh dispatch cannot inherit an ID that logs still reference from the previous record.
 
 Status is derived from liveness plus exit code, never stored:
@@ -51,7 +49,7 @@ To dispatch an async, supervised A2A call and later retrieve the output:
 
 ```bash
 wackyproc run wackypub agent <target> prompt --async "...NO_RESPONSE..."
-wackyproc wait --for <proc_id>
+wackyproc wait <proc_id>
 wackyproc get <proc_id>   # stdout holds the target's model output
 ```
 
