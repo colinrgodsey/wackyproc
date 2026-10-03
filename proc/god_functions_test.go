@@ -133,36 +133,30 @@ func TestCleanupProcDir(t *testing.T) {
 	}
 }
 
-func TestFindTerminalProcess(t *testing.T) {
-	cwd := t.TempDir()
+func TestFindCompleted(t *testing.T) {
 	list := []ProcessInfo{
 		{ID: "run1", Status: StatusRunning},
 		{ID: "done", Status: StatusCompleted},
 		{ID: "fail", Status: StatusFailed},
 	}
 
-	// Target found and terminal
-	id, ok, err := findTerminalProcess(cwd, list, true, "done", nil)
-	if err != nil || !ok || id != "done" {
-		t.Errorf("expected found target done, got id=%q, ok=%v, err=%v", id, ok, err)
+	// Mixed set: only the completed ID is terminal; the running one is not.
+	terminal, err := findCompleted(list, []string{"run1", "done"})
+	if err != nil {
+		t.Fatalf("findCompleted failed: %v", err)
+	}
+	if terminal["run1"] || !terminal["done"] {
+		t.Errorf("expected run1 running and done terminal, got %+v", terminal)
 	}
 
-	// Target found and running
-	id, ok, err = findTerminalProcess(cwd, list, true, "run1", nil)
-	if err != nil || ok || id != "" {
-		t.Errorf("expected running target to return ok=false, got id=%q, ok=%v, err=%v", id, ok, err)
+	// All-terminal set.
+	terminal, err = findCompleted(list, []string{"done", "fail"})
+	if err != nil || !terminal["done"] || !terminal["fail"] {
+		t.Errorf("expected done+fail terminal, got %+v err=%v", terminal, err)
 	}
 
-	// Target not in list and not on disk -> error
-	_, _, err = findTerminalProcess(cwd, list, true, "nonexistent", nil)
-	if err == nil {
-		t.Errorf("expected error for nonexistent target")
-	}
-
-	// Untargeted with baseline excluding done
-	baseline := map[string]bool{"done": true}
-	id, ok, err = findTerminalProcess(cwd, list, false, "", baseline)
-	if err != nil || !ok || id != "fail" {
-		t.Errorf("expected fail to satisfy untargeted wait, got id=%q, ok=%v, err=%v", id, ok, err)
+	// A listed ID missing from the listing is an error (fail fast).
+	if _, err = findCompleted(list, []string{"nonexistent"}); err == nil {
+		t.Errorf("expected error for ID missing from the listing")
 	}
 }

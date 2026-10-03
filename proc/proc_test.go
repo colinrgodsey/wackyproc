@@ -85,7 +85,7 @@ echo "stderr output line 1" >&2
 	}
 
 	// Wait for process to complete
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -125,7 +125,7 @@ echo "MYPID=$$"
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -198,7 +198,7 @@ echo "RECEIVED: $line"
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -408,13 +408,13 @@ func TestWait_Timeout(t *testing.T) {
 	createExecutable(t, cwd, "sleeper", `
 sleep 10
 `)
-	_, err := proc.Run(cwd, "sleeper", nil, nil)
+	id, err := proc.Run(cwd, "sleeper", nil, nil)
 	if err != nil {
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
 	// Wait 1 second (should timeout and return "")
-	resID, err := proc.Wait(cwd, 1)
+	resID, err := proc.Wait(cwd, 1, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -518,11 +518,14 @@ func TestSkill_FileContent(t *testing.T) {
 	if !strings.Contains(skillStr, "# WackyProc Process Management & Long-Running Command Guide") {
 		t.Errorf("expected skill to contain guide title")
 	}
-	if !strings.Contains(skillStr, "wackyproc wait --for") {
-		t.Errorf("expected skill to document 'wackyproc wait --for'")
+	if !strings.Contains(skillStr, "wackyproc wait 10 a1b2 c3d4") {
+		t.Errorf("expected skill to document the first-completed wait form")
 	}
-	if !strings.Contains(skillStr, "invisible to any-mode") {
-		t.Errorf("expected skill to document terminal-at-entry invisibility contract")
+	if !strings.Contains(skillStr, "--all") {
+		t.Errorf("expected skill to document the --all barrier")
+	}
+	if !strings.Contains(skillStr, "the old bare any-mode wait is removed") {
+		t.Errorf("expected skill to document the any-mode removal")
 	}
 	if strings.Contains(skillStr, "(recorded as 137)") {
 		t.Errorf("expected skill to drop obsolete '(recorded as 137)'")
@@ -662,7 +665,7 @@ done
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -680,120 +683,6 @@ done
 		if !strings.Contains(output, "ARG: "+expectedArg) {
 			t.Errorf("expected arg %q to be passed to tool, got output:\n%s", expectedArg, output)
 		}
-	}
-}
-
-// TestWait_AnyMode_NoEligible_ReturnsImmediately pins acceptance 1+2: an any-mode wait
-// with ZERO eligible (running-at-entry) processes returns immediately instead of
-// burning the timeout. Covers both the empty-store case and the only-terminal case.
-func TestWait_AnyMode_NoEligible_ReturnsImmediately(t *testing.T) {
-	cwd := setupTestEnv(t)
-
-	// Acceptance 1: zero processes at all.
-	start := time.Now()
-	_, err := proc.Wait(cwd, 600)
-	if err != proc.ErrNothingToWaitFor {
-		t.Fatalf("expected ErrNothingToWaitFor with zero processes, got %v", err)
-	}
-	if time.Since(start) > 100*time.Millisecond {
-		t.Errorf("zero-process wait took %v, want immediate", time.Since(start))
-	}
-
-	// Acceptance 2: only terminal processes.
-	createExecutable(t, cwd, "fast-finish", `exit 0`)
-	_, err = proc.Run(cwd, "fast-finish", nil, nil)
-	if err != nil {
-		t.Fatalf("proc.Run failed: %v", err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-		list, _ := proc.List(cwd)
-		if len(list) > 0 && list[0].Status == proc.StatusCompleted {
-			break
-		}
-	}
-
-	start = time.Now()
-	_, err = proc.Wait(cwd, 600)
-	if err != proc.ErrNothingToWaitFor {
-		t.Fatalf("expected ErrNothingToWaitFor with only-terminal processes, got %v", err)
-	}
-	if time.Since(start) > 100*time.Millisecond {
-		t.Errorf("only-terminal wait took %v, want immediate", time.Since(start))
-	}
-}
-func TestWait_AnyMode_ReturnsProcessTransitioningToTerminal(t *testing.T) {
-	cwd := setupTestEnv(t)
-
-	// Create an already-terminal baseline process
-	createExecutable(t, cwd, "old-proc", `exit 0`)
-	oldID, err := proc.Run(cwd, "old-proc", nil, nil)
-	if err != nil {
-		t.Fatalf("proc.Run failed: %v", err)
-	}
-
-	// Wait until old-proc has fully terminated
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-		list, _ := proc.List(cwd)
-		if len(list) > 0 && list[0].Status == proc.StatusCompleted {
-			break
-		}
-	}
-
-	// Create a controlled process that waits for a trigger file
-	triggerFile := filepath.Join(cwd, "trigger_any")
-	createExecutable(t, cwd, "controlled-any", fmt.Sprintf(`
-while [ ! -f %q ]; do
-  sleep 0.02
-done
-exit 0
-`, triggerFile))
-
-	controlledID, err := proc.Run(cwd, "controlled-any", nil, nil)
-	if err != nil {
-		t.Fatalf("proc.Run controlled-any failed: %v", err)
-	}
-
-	type result struct {
-		id  string
-		err error
-	}
-	resCh := make(chan result, 1)
-	go func() {
-		gotID, waitErr := proc.Wait(cwd, 3)
-		resCh <- result{id: gotID, err: waitErr}
-	}()
-
-	// Assert that Wait blocks while controlled-any is still running
-	select {
-	case res := <-resCh:
-		t.Fatalf("proc.Wait returned prematurely: id=%q, err=%v", res.id, res.err)
-	case <-time.After(50 * time.Millisecond):
-		// Expected: still blocked
-	}
-
-	// Release the controlled process by creating the trigger file
-	if err := os.WriteFile(triggerFile, []byte("release"), 0644); err != nil {
-		t.Fatalf("failed to write trigger file: %v", err)
-	}
-
-	// Assert that Wait completes within bounded time and returns controlledID (not oldID!)
-	select {
-	case res := <-resCh:
-		if res.err != nil {
-			t.Fatalf("proc.Wait failed: %v", res.err)
-		}
-		if res.id == oldID {
-			t.Fatalf("proc.Wait incorrectly returned baseline process %q instead of %q", oldID, controlledID)
-		}
-		if res.id != controlledID {
-			t.Fatalf("expected completed ID %q, got %q", controlledID, res.id)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for proc.Wait to detect completed process")
 	}
 }
 
@@ -921,24 +810,124 @@ exit 0
 	}
 }
 
-// TestWait_NoTrackedProcesses_ReturnsImmediately pins acceptance 1: an any-mode wait
-// with ZERO tracked processes has nothing eligible by definition, so it returns
-// immediately with ErrNothingToWaitFor instead of blocking the full timeout.
-func TestWait_NoTrackedProcesses_ReturnsImmediately(t *testing.T) {
+// TestWait_BareRequiresIDs pins the removal of the bare any-mode wait: a wait
+// with no process IDs fails fast instead of blocking the timeout.
+func TestWait_BareRequiresIDs(t *testing.T) {
 	cwd := setupTestEnv(t)
 
 	start := time.Now()
 	gotID, err := proc.Wait(cwd, 600)
 	elapsed := time.Since(start)
-
-	if err != proc.ErrNothingToWaitFor {
-		t.Fatalf("expected ErrNothingToWaitFor with no tracked processes, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "at least one process ID") {
+		t.Fatalf("expected a missing-IDs error, got id=%q err=%v", gotID, err)
 	}
 	if gotID != "" {
 		t.Fatalf("expected empty ID, got %q", gotID)
 	}
 	if elapsed > 100*time.Millisecond {
-		t.Errorf("expected immediate return, took %v", elapsed)
+		t.Errorf("expected immediate return, took %v (elapsed)", elapsed)
+	}
+}
+func TestWait_FirstCompletedOfMany(t *testing.T) {
+	cwd := setupTestEnv(t)
+	createExecutable(t, cwd, "fast-tool", "sleep 0.2")
+	createExecutable(t, cwd, "slow-tool", "sleep 1")
+
+	fastID, err := proc.Run(cwd, "fast-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run fast failed: %v", err)
+	}
+	slowID, err := proc.Run(cwd, "slow-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run slow failed: %v", err)
+	}
+
+	start := time.Now()
+	gotID, err := proc.Wait(cwd, 5, fastID, slowID)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if gotID != fastID {
+		t.Errorf("expected first completed %q, got %q", fastID, gotID)
+	}
+	if elapsed > 800*time.Millisecond {
+		t.Errorf("expected first-completed return well before the slow process finishes, took %v", elapsed)
+	}
+	if gotID, err := proc.Wait(cwd, 5, slowID); err != nil || gotID != slowID {
+		t.Fatalf("expected slow ID back, got %q err=%v", gotID, err)
+	}
+}
+
+func TestWaitAll_Barrier(t *testing.T) {
+	cwd := setupTestEnv(t)
+	createExecutable(t, cwd, "fast-tool", "sleep 0.2")
+	createExecutable(t, cwd, "slow-tool", "sleep 1")
+
+	fastID, err := proc.Run(cwd, "fast-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run fast failed: %v", err)
+	}
+	slowID, err := proc.Run(cwd, "slow-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run slow failed: %v", err)
+	}
+
+	start := time.Now()
+	gotID, err := proc.WaitAll(cwd, 5, fastID, slowID)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("proc.WaitAll failed: %v", err)
+	}
+	if gotID != slowID {
+		t.Errorf("expected last completed %q, got %q", slowID, gotID)
+	}
+	if elapsed < 800*time.Millisecond {
+		t.Errorf("expected the barrier to hold for both processes, returned after only %v", elapsed)
+	}
+	if elapsed > 4*time.Second {
+		t.Errorf("barrier took too long: %v", elapsed)
+	}
+}
+
+func TestWait_AlreadyTerminalAtEntry(t *testing.T) {
+	cwd := setupTestEnv(t)
+	createExecutable(t, cwd, "quick-tool", "exit 0")
+	id, err := proc.Run(cwd, "quick-tool", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+	if _, err := proc.Wait(cwd, 5, id); err != nil {
+		t.Fatalf("initial wait failed: %v", err)
+	}
+
+	start := time.Now()
+	gotID, err := proc.Wait(cwd, 1, id)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if gotID != id {
+		t.Errorf("expected %q, got %q", id, gotID)
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("expected immediate return for already-terminal entry, took %v", elapsed)
+	}
+}
+
+func TestWait_UnknownID(t *testing.T) {
+	cwd := setupTestEnv(t)
+	start := time.Now()
+	gotID, err := proc.Wait(cwd, 5, "zzzzzzzz")
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("expected not-found error, got id=%q err=%v", gotID, err)
+	}
+	if gotID != "" {
+		t.Fatalf("expected empty ID, got %q", gotID)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("expected immediate failure, took %v", elapsed)
 	}
 }
 func TestPeek_UnknownProcID(t *testing.T) {
@@ -971,7 +960,7 @@ echo "stderr line 1" >&2
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -1009,7 +998,7 @@ done
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -1045,7 +1034,7 @@ printf "line 1\nline 2\npartial ending"
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -1093,7 +1082,7 @@ exit 0
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -1140,7 +1129,7 @@ echo "test output"
 		t.Fatalf("proc.Run failed: %v", err)
 	}
 
-	completedID, err := proc.Wait(cwd, 5)
+	completedID, err := proc.Wait(cwd, 5, id)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)
 	}
@@ -1201,30 +1190,22 @@ echo "test output"
 		t.Errorf("exit_code modified by Peek: before=%q, after=%q", string(exitBefore), string(exitAfter))
 	}
 
-	var metaParsed proc.Meta
-	if err := json.Unmarshal(metaAfter, &metaParsed); err != nil {
-		t.Fatalf("unmarshal metaAfter: %v", err)
-	}
-	if metaParsed.ConsumedSeq != 0 {
-		t.Errorf("expected ConsumedSeq to be 0 after Peek, got %d", metaParsed.ConsumedSeq)
-	}
-	if strings.Contains(string(metaAfter), "consumed_seq") {
-		t.Errorf("expected consumed_seq to be omitted/absent from meta.json after Peek, got %q", string(metaAfter))
+	if string(metaBefore) != string(metaAfter) {
+		t.Errorf("Peek modified meta.json: before=%s after=%s", metaBefore, metaAfter)
 	}
 }
 
-func seedProcessRecord(t *testing.T, cwd string, id string, tool string, status string, gen uint64, consumedSeq uint64) {
+func seedProcessRecord(t *testing.T, cwd string, id string, tool string, status string, gen uint64) {
 	t.Helper()
 	procDir := filepath.Join(cwd, proc.ProcDirName, id)
 	if err := os.MkdirAll(procDir, 0755); err != nil {
 		t.Fatalf("failed to create proc dir %s: %v", id, err)
 	}
 	meta := proc.Meta{
-		ID:          id,
-		Tool:        tool,
-		StartedAt:   time.Now().Unix(),
-		Gen:         gen,
-		ConsumedSeq: consumedSeq,
+		ID:        id,
+		Tool:      tool,
+		StartedAt: time.Now().Unix(),
+		Gen:       gen,
 	}
 	metaData, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -1253,114 +1234,71 @@ func seedProcessRecord(t *testing.T, cwd string, id string, tool string, status 
 	_ = os.WriteFile(filepath.Join(procDir, proc.StderrFileName), []byte("stderr\n"), 0644)
 }
 
-func TestGet_MarksTerminalConsumed(t *testing.T) {
+func TestGet_MarksNothing(t *testing.T) {
 	cwd := setupTestEnv(t)
 	createExecutable(t, cwd, "quick-tool", "echo 'hello world'")
 
-	// 1. Terminal process: get marks consumed with monotonic sequence
 	id, err := proc.Run(cwd, "quick-tool", nil, nil)
 	if err != nil {
 		t.Fatalf("proc.Run failed: %v", err)
 	}
-
-	completedID, err := proc.Wait(cwd, 5)
-	if err != nil || completedID != id {
-		t.Fatalf("proc.Wait failed: %v (id: %s)", err, completedID)
+	if _, err := proc.Wait(cwd, 5, id); err != nil {
+		t.Fatalf("waiting for terminal: %v", err)
 	}
 
-	procDir := filepath.Join(cwd, proc.ProcDirName, id)
-	metaPath := filepath.Join(procDir, proc.MetaFileName)
-
-	var meta proc.Meta
-	metaBytes, _ := os.ReadFile(metaPath)
-	_ = json.Unmarshal(metaBytes, &meta)
-	if meta.ConsumedSeq != 0 {
-		t.Fatalf("expected ConsumedSeq to be 0 before get, got %d", meta.ConsumedSeq)
+	metaPath := filepath.Join(cwd, proc.ProcDirName, id, proc.MetaFileName)
+	metaBefore, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta: %v", err)
 	}
 
 	var stdoutBuf, stderrBuf bytes.Buffer
 	if err := proc.Get(cwd, id, &stdoutBuf, &stderrBuf); err != nil {
 		t.Fatalf("proc.Get failed: %v", err)
 	}
-
-	metaBytes, _ = os.ReadFile(metaPath)
-	_ = json.Unmarshal(metaBytes, &meta)
-	seq1 := meta.ConsumedSeq
-	if seq1 == 0 {
-		t.Fatalf("expected ConsumedSeq to be > 0 after terminal get, got 0")
+	if got := strings.TrimSpace(stdoutBuf.String()); got != "hello world" {
+		t.Errorf("expected stdout %q, got %q", "hello world", got)
 	}
 
-	// 2. Second get: set-once, leaves ConsumedSeq unchanged
-	stdoutBuf.Reset()
-	stderrBuf.Reset()
-	if err := proc.Get(cwd, id, &stdoutBuf, &stderrBuf); err != nil {
-		t.Fatalf("second proc.Get failed: %v", err)
-	}
-	metaBytes, _ = os.ReadFile(metaPath)
-	_ = json.Unmarshal(metaBytes, &meta)
-	if meta.ConsumedSeq != seq1 {
-		t.Errorf("expected ConsumedSeq to remain %d, got %d", seq1, meta.ConsumedSeq)
-	}
-
-	// 3. Unconsume clears ConsumedSeq
-	if err := proc.Unconsume(cwd, id); err != nil {
-		t.Fatalf("proc.Unconsume failed: %v", err)
-	}
-	metaBytes, _ = os.ReadFile(metaPath)
-	meta = proc.Meta{}
-	_ = json.Unmarshal(metaBytes, &meta)
-	if meta.ConsumedSeq != 0 {
-		t.Errorf("expected ConsumedSeq to be 0 after unconsume, got %d", meta.ConsumedSeq)
-	}
-	if strings.Contains(string(metaBytes), "consumed_seq") {
-		t.Errorf("expected consumed_seq to be omitted from JSON after unconsume, got %q", string(metaBytes))
-	}
-
-	// 4. Terminal get after unconsume assigns a FRESH (higher) sequence value
-	if err := proc.Get(cwd, id, &stdoutBuf, &stderrBuf); err != nil {
-		t.Fatalf("proc.Get after unconsume failed: %v", err)
-	}
-	metaBytes, _ = os.ReadFile(metaPath)
-	meta = proc.Meta{}
-	_ = json.Unmarshal(metaBytes, &meta)
-	seq2 := meta.ConsumedSeq
-	if seq2 <= seq1 {
-		t.Errorf("expected fresh sequence seq2 (%d) > seq1 (%d)", seq2, seq1)
-	}
-
-	// 5. Running process: get leaves ConsumedSeq as 0
-	createExecutable(t, cwd, "sleep-tool", "sleep 10")
-	runningID, err := proc.Run(cwd, "sleep-tool", nil, nil)
+	// Get is a pure stream: the on-disk record is byte-identical afterwards.
+	metaAfter, err := os.ReadFile(metaPath)
 	if err != nil {
-		t.Fatalf("proc.Run sleep-tool failed: %v", err)
+		t.Fatalf("re-read meta: %v", err)
 	}
-	defer proc.Stop(cwd, runningID, 1)
-
-	runningMetaPath := filepath.Join(cwd, proc.ProcDirName, runningID, proc.MetaFileName)
-	if err := proc.Get(cwd, runningID, &stdoutBuf, &stderrBuf); err != nil {
-		t.Fatalf("proc.Get on running process failed: %v", err)
-	}
-	metaBytes, _ = os.ReadFile(runningMetaPath)
-	var runningMeta proc.Meta
-	_ = json.Unmarshal(metaBytes, &runningMeta)
-	if runningMeta.ConsumedSeq != 0 {
-		t.Errorf("expected running process to have ConsumedSeq=0, got %d", runningMeta.ConsumedSeq)
+	if string(metaBefore) != string(metaAfter) {
+		t.Errorf("Get modified meta.json: before=%s after=%s", metaBefore, metaAfter)
 	}
 
-	// 6. Peek on terminal process leaves ConsumedSeq unchanged (0 if unconsumed)
-	peekID, err := proc.Run(cwd, "quick-tool", nil, nil)
+	// The cap still retires old records with no consumed state: seed the store
+	// past the cap with this record as the oldest, then let List self-heal.
+	// The record must be the one retired.
+	for i := 1; i <= proc.MaxTerminalEntries; i++ {
+		seedProcessRecord(t, cwd, fmt.Sprintf("z%03d", i), "tool-seed", proc.StatusCompleted, uint64(i)+1)
+	}
+	oldStderr := os.Stderr
+	rPipe, wPipe, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("proc.Run failed: %v", err)
+		t.Fatalf("os.Pipe: %v", err)
 	}
-	_, _ = proc.Wait(cwd, 5)
-	if err := proc.Peek(cwd, peekID, 10, &stdoutBuf, &stderrBuf); err != nil {
-		t.Fatalf("proc.Peek failed: %v", err)
+	os.Stderr = wPipe
+	list, listErr := proc.List(cwd)
+	wPipe.Close()
+	os.Stderr = oldStderr
+	if listErr != nil {
+		t.Fatalf("proc.List failed: %v", listErr)
 	}
-	metaBytes, _ = os.ReadFile(filepath.Join(cwd, proc.ProcDirName, peekID, proc.MetaFileName))
-	var peekMeta proc.Meta
-	_ = json.Unmarshal(metaBytes, &peekMeta)
-	if peekMeta.ConsumedSeq != 0 {
-		t.Errorf("expected peek to leave ConsumedSeq=0, got %d", peekMeta.ConsumedSeq)
+	var retireErr bytes.Buffer
+	_, _ = io.Copy(&retireErr, rPipe)
+	if !strings.Contains(retireErr.String(), fmt.Sprintf("retired terminal record %s (cap %d)", id, proc.MaxTerminalEntries)) {
+		t.Errorf("expected the oldest record to be retired, stderr: %s", retireErr.String())
+	}
+	if len(list) != proc.MaxTerminalEntries {
+		t.Fatalf("expected List to self-heal to %d records, got %d", proc.MaxTerminalEntries, len(list))
+	}
+	for _, p := range list {
+		if p.ID == id {
+			t.Fatalf("expected the oldest (gen 1) record to be retired by the cap, but %s is still listed", id)
+		}
 	}
 }
 
@@ -1419,103 +1357,105 @@ func TestSeq_ConcurrentAndGenOrdering(t *testing.T) {
 	}
 }
 
-func TestDisposal_RunAndListWarning(t *testing.T) {
-	cwd := setupTestEnv(t)
-	createExecutable(t, cwd, "quick-tool", "echo 1")
+func TestCapRetiresOldestRegardless(t *testing.T) {
+	t.Run("run_growth_point", func(t *testing.T) {
+		cwd := setupTestEnv(t)
+		createExecutable(t, cwd, "quick-tool", "echo 1")
 
-	// Seed 105 terminal records:
-	// 10 consumed records (gens 1..10)
-	// 95 unconsumed records (gens 11..105)
-	// 1 running record
-	for i := 1; i <= 10; i++ {
-		id := fmt.Sprintf("c%03d", i)
-		seedProcessRecord(t, cwd, id, "tool-consumed", proc.StatusCompleted, uint64(i), uint64(i))
-	}
-	for i := 11; i <= 105; i++ {
-		id := fmt.Sprintf("u%03d", i)
-		seedProcessRecord(t, cwd, id, "tool-unconsumed", proc.StatusCompleted, uint64(i), 0)
-	}
-	seedProcessRecord(t, cwd, "r001", "tool-running", proc.StatusRunning, 106, 0)
-
-	// One more Run: spawns a process and runs disposal
-	newID, err := proc.Run(cwd, "quick-tool", nil, nil)
-	if err != nil {
-		t.Fatalf("proc.Run failed: %v", err)
-	}
-	_ = newID
-
-	// Disposal should have removed lowest-gen consumed records down to cap (100).
-	// We had 105 terminal records. Removing 5 consumed records brings it to 100.
-	// Records c001..c005 should be gone
-	for i := 1; i <= 5; i++ {
-		id := fmt.Sprintf("c%03d", i)
-		p := filepath.Join(cwd, proc.ProcDirName, id)
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("expected consumed record %s to be auto-disposed, but it still exists", id)
+		for i := 1; i <= 105; i++ {
+			seedProcessRecord(t, cwd, fmt.Sprintf("x%03d", i), "tool-seed", proc.StatusCompleted, uint64(i))
 		}
-	}
-	// Records c006..c010 should still exist
-	for i := 6; i <= 10; i++ {
-		id := fmt.Sprintf("c%03d", i)
-		p := filepath.Join(cwd, proc.ProcDirName, id)
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			t.Errorf("expected consumed record %s to be preserved, but it was deleted", id)
+		seedProcessRecord(t, cwd, "r001", "tool-running", proc.StatusRunning, 106)
+
+		// The seq counter allocates the new record's Gen; seed it past the
+		// explicit Gens above so the fresh record is the newest.
+		if err := os.WriteFile(filepath.Join(cwd, proc.ProcDirName, proc.SeqFileName), []byte("106\n"), 0644); err != nil {
+			t.Fatalf("seed .seq: %v", err)
 		}
-	}
-	// All 95 unconsumed records must still exist
-	for i := 11; i <= 105; i++ {
-		id := fmt.Sprintf("u%03d", i)
-		p := filepath.Join(cwd, proc.ProcDirName, id)
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			t.Errorf("expected unconsumed record %s to be preserved, but it was deleted", id)
+
+		oldStderr := os.Stderr
+		rPipe, wPipe, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
 		}
-	}
-	// Running record must still exist
-	if _, err := os.Stat(filepath.Join(cwd, proc.ProcDirName, "r001")); os.IsNotExist(err) {
-		t.Errorf("expected running record r001 to be preserved, but it was deleted")
-	}
+		os.Stderr = wPipe
+		newID, runErr := proc.Run(cwd, "quick-tool", nil, nil)
+		wPipe.Close()
+		os.Stderr = oldStderr
+		if runErr != nil {
+			t.Fatalf("proc.Run failed: %v", runErr)
+		}
+		var stderrBuf bytes.Buffer
+		_, _ = io.Copy(&stderrBuf, rPipe)
+		stderrOut := stderrBuf.String()
 
-	// 2. Cap exceeded and zero consumed terminals: nothing is disposed and List prints single stderr warning
-	cwd2 := setupTestEnv(t)
-	createExecutable(t, cwd2, "quick-tool", "echo 1")
+		// Exactly the five oldest terminal records are retired at the growth point.
+		for i := 1; i <= 5; i++ {
+			if !strings.Contains(stderrOut, fmt.Sprintf("retired terminal record x%03d (cap %d)", i, proc.MaxTerminalEntries)) {
+				t.Errorf("expected retirement line for x%03d, got: %s", i, stderrOut)
+			}
+		}
+		if strings.Contains(stderrOut, "retired terminal record x006") {
+			t.Errorf("x006 must not have been retired: %s", stderrOut)
+		}
+		if strings.Contains(stderrOut, "warning") || strings.Contains(stderrOut, "0 disposable") {
+			t.Errorf("expected no warning spam, got: %s", stderrOut)
+		}
 
-	// Seed 105 unconsumed terminal records
-	for i := 1; i <= 105; i++ {
-		id := fmt.Sprintf("x%03d", i)
-		seedProcessRecord(t, cwd2, id, "tool-unconsumed", proc.StatusCompleted, uint64(i), 0)
-	}
+		list, err := proc.List(cwd)
+		if err != nil {
+			t.Fatalf("proc.List failed: %v", err)
+		}
+		byID := map[string]bool{}
+		for _, p := range list {
+			byID[p.ID] = true
+		}
+		for i := 1; i <= 5; i++ {
+			if byID[fmt.Sprintf("x%03d", i)] {
+				t.Errorf("x%03d should have been retired", i)
+			}
+		}
+		if !byID["r001"] {
+			t.Errorf("running record r001 must not be retired")
+		}
+		if !byID[newID] {
+			t.Errorf("newly created record %s missing from list", newID)
+		}
+	})
 
-	// Capture stderr around proc.List
-	oldStderr := os.Stderr
-	rPipe, wPipe, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe failed: %v", err)
-	}
-	os.Stderr = wPipe
-
-	list, err := proc.List(cwd2)
-
-	_ = wPipe.Close()
-	os.Stderr = oldStderr
-
-	var stderrBuf bytes.Buffer
-	_, _ = io.Copy(&stderrBuf, rPipe)
-	_ = rPipe.Close()
-
-	if err != nil {
-		t.Fatalf("proc.List failed: %v", err)
-	}
-	if len(list) != 105 {
-		t.Errorf("expected 105 records in list, got %d", len(list))
-	}
-
-	stderrOut := stderrBuf.String()
-	if !strings.Contains(stderrOut, "105 terminal process records exceed cap of 100 with 0 disposable") {
-		t.Errorf("expected warning in stderr naming both counts, got: %q", stderrOut)
-	}
-	if !strings.Contains(stderrOut, "wackyproc prune") {
-		t.Errorf("expected warning to suggest 'wackyproc prune', got: %q", stderrOut)
-	}
+	t.Run("list_self_heal", func(t *testing.T) {
+		cwd := setupTestEnv(t)
+		for i := 1; i <= 105; i++ {
+			seedProcessRecord(t, cwd, fmt.Sprintf("y%03d", i), "tool-seed", proc.StatusCompleted, uint64(i))
+		}
+		oldStderr := os.Stderr
+		rPipe, wPipe, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		os.Stderr = wPipe
+		list, listErr := proc.List(cwd)
+		wPipe.Close()
+		os.Stderr = oldStderr
+		if listErr != nil {
+			t.Fatalf("proc.List failed: %v", listErr)
+		}
+		var stderrBuf bytes.Buffer
+		_, _ = io.Copy(&stderrBuf, rPipe)
+		if len(list) != proc.MaxTerminalEntries {
+			t.Fatalf("expected List to self-heal to %d records, got %d", proc.MaxTerminalEntries, len(list))
+		}
+		for i := 1; i <= 5; i++ {
+			for _, p := range list {
+				if p.ID == fmt.Sprintf("y%03d", i) {
+					t.Errorf("y%03d should have been retired", i)
+				}
+			}
+		}
+		if s := stderrBuf.String(); strings.Contains(s, "warning") || strings.Contains(s, "0 disposable") {
+			t.Errorf("expected no warning spam, got: %s", s)
+		}
+	})
 }
 
 func TestPrune(t *testing.T) {
@@ -1524,10 +1464,10 @@ func TestPrune(t *testing.T) {
 	_ = os.MkdirAll(procBaseDir, 0755)
 
 	// Seed 3 terminal records (mix consumed and unconsumed) and 1 running record
-	seedProcessRecord(t, cwd, "t001", "tool-a", proc.StatusCompleted, 1, 1)
-	seedProcessRecord(t, cwd, "t002", "tool-b", proc.StatusFailed, 2, 0)
-	seedProcessRecord(t, cwd, "t003", "tool-c", proc.StatusCrashed, 3, 2)
-	seedProcessRecord(t, cwd, "r001", "tool-run", proc.StatusRunning, 4, 0)
+	seedProcessRecord(t, cwd, "t001", "tool-a", proc.StatusCompleted, 1)
+	seedProcessRecord(t, cwd, "t002", "tool-b", proc.StatusFailed, 2)
+	seedProcessRecord(t, cwd, "t003", "tool-c", proc.StatusCrashed, 3)
+	seedProcessRecord(t, cwd, "r001", "tool-run", proc.StatusRunning, 4)
 
 	// Seed non-record items
 	_ = os.MkdirAll(filepath.Join(procBaseDir, proc.SeqLockDirName), 0755)
@@ -1581,7 +1521,7 @@ func TestGet_JustRemovedRecordDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proc.Run failed: %v", err)
 	}
-	_, _ = proc.Wait(cwd, 5)
+	_, _ = proc.Wait(cwd, 5, id)
 
 	// Simulate concurrent disposal right before Get
 	_ = os.RemoveAll(filepath.Join(cwd, proc.ProcDirName, id))
@@ -1607,7 +1547,7 @@ func TestGet_MissingIndividualFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("proc.Run failed: %v", err)
 		}
-		_, _ = proc.Wait(cwd, 5)
+		_, _ = proc.Wait(cwd, 5, id)
 
 		procDir := filepath.Join(cwd, proc.ProcDirName, id)
 		_ = os.Remove(filepath.Join(procDir, proc.StdoutFileName))
@@ -1634,7 +1574,7 @@ func TestGet_MissingIndividualFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("proc.Run failed: %v", err)
 		}
-		_, _ = proc.Wait(cwd, 5)
+		_, _ = proc.Wait(cwd, 5, id)
 
 		procDir := filepath.Join(cwd, proc.ProcDirName, id)
 		_ = os.Remove(filepath.Join(procDir, proc.StderrFileName))
@@ -1662,7 +1602,7 @@ func TestGet_MissingIndividualFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("proc.Run failed: %v", err)
 		}
-		_, _ = proc.Wait(cwd, 5)
+		_, _ = proc.Wait(cwd, 5, id)
 
 		procDir := filepath.Join(cwd, proc.ProcDirName, id)
 		_ = os.Remove(filepath.Join(procDir, proc.MetaFileName))
@@ -1938,18 +1878,6 @@ func TestDescribe_FullDetailsAndDoesNotConsume(t *testing.T) {
 		t.Errorf("expected output file locations, got stdout=%q stderr=%q", info.StdoutFile, info.StderrFile)
 	}
 
-	// Describe must NOT mark consumed (Get's job).
-	meta, _ := os.ReadFile(filepath.Join(cwd, proc.ProcDirName, id, proc.MetaFileName))
-	var metaParsed proc.Meta
-	if err := json.Unmarshal(meta, &metaParsed); err != nil {
-		t.Fatalf("meta parse: %v", err)
-	}
-	if metaParsed.ConsumedSeq != 0 {
-		t.Errorf("describe marked record consumed (ConsumedSeq=%d) - should never consume", metaParsed.ConsumedSeq)
-	}
-	if info.Consumed {
-		t.Errorf("describe reported consumed=true before any Get")
-	}
 }
 
 // TestDescribe_NotFound verifies describe errors cleanly on a missing id.
@@ -1973,7 +1901,7 @@ func TestWait_ShortTaskLatency(t *testing.T) {
 	}
 
 	start := time.Now()
-	resID, err := proc.Wait(cwd, 10)
+	resID, err := proc.Wait(cwd, 10, id)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("proc.Wait failed: %v", err)

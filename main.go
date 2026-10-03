@@ -23,6 +23,21 @@ var (
 	flagErrTokenPattern = regexp.MustCompile(`(?:in |unknown flag: )(--?\S+)`)
 )
 
+// isAllDigits reports whether s is a non-empty string of ASCII digits.
+// wackyproc uses it to tell the optional wait timeout apart from process IDs:
+// record IDs are 8-character pronounceable slugs and can never be all digits.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 //go:embed skills/wackyproc/SKILL.md
 var bundledWackyprocSkill string
 
@@ -30,7 +45,7 @@ var (
 	jsonOutput   bool
 	describeJSON bool
 	stopTimeout  int
-	waitFor      string
+	allWait      bool
 	peekLines    int
 )
 
@@ -130,29 +145,32 @@ var listCmd = &cobra.Command{
 }
 
 var waitCmd = &cobra.Command{
-	Use:   "wait [seconds]",
-	Short: "Wait for a background process to reach a terminal state",
-	Long: `Blocks up to the specified timeout (in seconds) waiting for a tracked
-background process to finish (COMPLETED, FAILED, or CRASHED).
+	Use:   "wait [seconds] <proc_id> [proc_id...]",
+	Short: "Wait for background processes to reach a terminal state",
+	Long: `Blocks up to the timeout waiting for the listed background processes to finish
+(COMPLETED, FAILED, or CRASHED). At least one process ID is required: the old
+bare any-mode wait is removed.
 
-Timeout must be a non-negative integer. Sub-second requests (such as 0) poll for ~1s.
+The first argument is the timeout in seconds when it looks like one
+(a non-negative integer); process IDs are 8-character pronounceable slugs and
+never do. The default timeout is the maximum wait.
 
-In any-mode (default), waits for any process that was still running when the
-call began to reach a terminal state, ignoring processes already terminal at entry.
-If --for <id> is specified, waits for that specific process to complete (even if
-already terminal at entry).
+Default (first-completed) semantics: returns as soon as ANY listed process
+completes, printing the completed process ID. A listed process already terminal
+at call time is returned immediately.
 
-Returns the process ID of the completed process and exits 0.
-If the timeout expires before a process finishes, exits non-zero.`,
+With --all, waits until ALL listed processes complete (the batch barrier) and
+prints the last one to finish.
+
+Returns the completed process ID and exits 0.
+If the timeout expires before completion, exits non-zero.`,
 	SilenceUsage: true,
 	Args: func(cmd *cobra.Command, args []string) error {
-		if err := cobra.MaximumNArgs(1)(cmd, args); err != nil {
+		if err := cobra.MinimumNArgs(1)(cmd, args); err != nil {
 			return err
 		}
-		if len(args) == 1 {
-			if n, err := strconv.Atoi(args[0]); err == nil && n < 0 {
-				return fmt.Errorf("wait: timeout must be a non-negative integer (got %s)", args[0])
-			}
+		if len(args) == 1 && negIntTokenPattern.MatchString(args[0]) {
+			return fmt.Errorf("wait: timeout must be a non-negative integer (got %s)", args[0])
 		}
 		return nil
 	},
@@ -163,20 +181,16 @@ If the timeout expires before a process finishes, exits non-zero.`,
 		}
 
 		timeoutSeconds := proc.MaxWaitSeconds
-		if len(args) == 1 {
-			var err error
+		rest := args
+		if isAllDigits(args[0]) {
 			timeoutSeconds, err = strconv.Atoi(args[0])
 			if err != nil {
 				return fmt.Errorf("invalid timeout seconds %q: %w", args[0], err)
 			}
-			if timeoutSeconds < 0 {
-				return fmt.Errorf("wait: timeout must be a non-negative integer (got %s)", args[0])
-			}
+			rest = args[1:]
 		}
-
-		var targetID []string
-		if cmd.Flags().Changed("for") {
-			targetID = []string{waitFor}
+		if len(rest) == 0 {
+			return fmt.Errorf("wait requires at least one process ID")
 		}
 
 		// Wire SIGINT/SIGTERM (agent turn cancel -> tool cancel -> wackyproc wait)
@@ -185,20 +199,21 @@ If the timeout expires before a process finishes, exits non-zero.`,
 		waitCtx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		procID, err := proc.WaitContext(waitCtx, cwd, timeoutSeconds, targetID...)
+		var procID string
+		if allWait {
+			procID, err = proc.WaitAllContext(waitCtx, cwd, timeoutSeconds, rest...)
+		} else {
+			procID, err = proc.WaitContext(waitCtx, cwd, timeoutSeconds, rest...)
+		}
 		if err != nil {
-			if errors.Is(err, proc.ErrNothingToWaitFor) {
-				fmt.Println("nothing to wait for")
-				return nil
-			}
 			return err
 		}
 
 		if procID == "" {
-			if len(targetID) > 0 && targetID[0] != "" {
-				return fmt.Errorf("timeout waiting for process %q", targetID[0])
+			if allWait {
+				return fmt.Errorf("timeout waiting for all of %v", rest)
 			}
-			return fmt.Errorf("timeout waiting for process")
+			return fmt.Errorf("timeout waiting for process(es) %v", rest)
 		}
 
 		fmt.Println(procID)
@@ -211,8 +226,7 @@ var describeCmd = &cobra.Command{
 	Short: "Show full details for one or more tracked processes",
 	Long: `Shows full details for the specified process ID(s): complete command args, working
 directory, tool path, status, pid/pgid, exit code, timestamps, captured-output file
-locations, and whether the record has been consumed. Does NOT mark the record consumed
-and does NOT print captured output (use get). With --json, emits a JSON array of the
+locations. It does NOT print captured output (use get). With --json, emits a JSON array of the
 records; without, prints a human-readable block per record.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -252,11 +266,6 @@ records; without, prints a human-readable block per record.`,
 			if info.PID > 0 {
 				pidStr = strconv.Itoa(info.PID)
 			}
-			consumed := "no"
-			if info.Consumed {
-				consumed = "yes"
-			}
-
 			fmt.Printf("ID:        %s\n", info.ID)
 			fmt.Printf("Tool:      %s\n", info.Tool)
 			if info.ToolPath != "" {
@@ -270,7 +279,6 @@ records; without, prints a human-readable block per record.`,
 			fmt.Printf("Exit:      %s\n", exitStr)
 			fmt.Printf("Cwd:       %s\n", info.Cwd)
 			fmt.Printf("Started:   %d\n", info.StartedAt)
-			fmt.Printf("Consumed:  %s\n", consumed)
 			fmt.Printf("Stdout:    %s\n", info.StdoutFile)
 			fmt.Printf("Stderr:    %s\n", info.StderrFile)
 			if info.StdinFile != "" {
@@ -388,7 +396,7 @@ numbers are reported as errors, never silently defaulted.`,
 var pruneCmd = &cobra.Command{
 	Use:   "prune",
 	Short: "Dispose all terminal background process records",
-	Long:  "Disposes all terminal (COMPLETED, FAILED, CRASHED) process records regardless of consumed state and reports removed IDs.",
+	Long:  "Disposes all terminal (COMPLETED, FAILED, CRASHED) process records and reports the removed IDs.",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
@@ -397,22 +405,6 @@ var pruneCmd = &cobra.Command{
 		}
 
 		return proc.Prune(cwd, os.Stdout)
-	},
-}
-
-var unconsumeCmd = &cobra.Command{
-	Use:   "unconsume <proc_id>",
-	Short: "Clear the consumed state of a process record",
-	Long:  "Clears the consumed sequence number of a process record so it can be preserved from auto-disposal.",
-	Args:  cobra.ExactArgs(1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("failed to get current working directory: %w", err)
-		}
-
-		procID := args[0]
-		return proc.Unconsume(cwd, procID)
 	},
 }
 
@@ -464,7 +456,7 @@ func init() {
 	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output process list as JSON")
 	describeCmd.Flags().BoolVar(&describeJSON, "json", false, "Output describe records as JSON")
 	stopCmd.Flags().IntVar(&stopTimeout, "timeout", proc.DefaultStopTimeoutSeconds, "Seconds to wait after SIGTERM before sending SIGKILL")
-	waitCmd.Flags().StringVar(&waitFor, "for", "", "Wait for a specific process ID to reach a terminal state")
+	waitCmd.Flags().BoolVar(&allWait, "all", false, "Wait until ALL listed processes complete (default: first completed)")
 	peekCmd.Flags().IntVar(&peekLines, "lines", 20, "Number of trailing lines of stdout and stderr to show")
 
 	waitCmd.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
@@ -491,7 +483,6 @@ func init() {
 	rootCmd.AddCommand(killCmd)
 	rootCmd.AddCommand(signalCmd)
 	rootCmd.AddCommand(pruneCmd)
-	rootCmd.AddCommand(unconsumeCmd)
 	rootCmd.AddCommand(removeCmd)
 	rootCmd.AddCommand(skillCmd)
 	rootCmd.AddCommand(superviseCmd)

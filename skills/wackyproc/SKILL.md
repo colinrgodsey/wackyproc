@@ -58,22 +58,22 @@ Note: `list --json` is COMPACT by contract - it returns only the table fields pl
 ```
 
 ### 3. Wait for Background Jobs to Finish
-Block up to `N` seconds for background processes to reach a terminal state:
+Block up to `N` seconds for listed processes to reach a terminal state:
 ```bash
-# Any-mode: wait for ANY process still running at call start
-wackyproc wait 10
+# First completed (default): returns the ID of the first listed process to finish
+wackyproc wait 10 a1b2 c3d4
 
-# Targeted: wait for a specific process (returns immediately if already terminal)
-wackyproc wait --for a1b2 10
+# Barrier: wait for ALL listed processes; returns the last one to finish
+wackyproc wait 10 --all a1b2 c3d4
 ```
-Processes already terminal at entry are invisible to any-mode `wait` (use `--for` + `get` instead). Requests longer than 500 seconds are silently capped at 500 - call `wait` again if nothing finished in time rather than requesting a single very long wait.
+At least one process ID is required - the old bare any-mode wait is removed, and a wait with no IDs fails fast. A process already terminal at entry is returned immediately; a listed ID that does not exist fails immediately. A timeout exits non-zero without returning an ID. Requests longer than 500 seconds are silently capped at 500 - call `wait` again if nothing finished in time rather than requesting a single very long wait.
 
 ### 4. Retrieve Output (Stdout & Stderr)
 Read the full captured stdout and stderr streams:
 ```bash
 wackyproc get a1b2
 ```
-`wackyproc get` streams output through standard stdout and stderr. In `wackypub`, large output is automatically captured into scratchpad entries. Retrieving output marks terminal process records as consumed, making them eligible for automatic disposal when the terminal record cap (100) is exceeded. To clear the consumed state and protect a record from disposal, run `wackyproc unconsume <id>`.
+`wackyproc get` streams output through standard stdout and stderr. In `wackypub`, large output is automatically captured into scratchpad entries. `get` is a pure stream: it marks nothing, and retrieving output has no effect on the record's lifetime.
 
 ### 5. Peek at Latest Output (Without Full Retrieval)
 Check a long-running job's latest output cheaply without pulling a full dump:
@@ -82,7 +82,7 @@ wackyproc peek a1b2
 # Or specify how many trailing lines to inspect (default 20):
 wackyproc peek a1b2 --lines 50
 ```
-`wackyproc peek` is a pure observer that reads trailing lines and writes no state. Unlike `get`, `peek` never marks records as consumed. Use `peek` to monitor progress or check recent errors while a process is still running or before deciding to retrieve full output.
+`wackyproc peek` is a pure observer that reads trailing lines and writes no state. Use `peek` to monitor progress or check recent errors while a process is still running or before deciding to retrieve full output.
 
 ### 6. Terminate a Process Group
 Gracefully stop a running process and all its child processes:
@@ -100,15 +100,11 @@ wackyproc signal a1b2 15
 ```
 
 ### 7. Clean Up & Manage Process Records
-`wackyproc run` automatically disposes the oldest consumed terminal records when terminal records exceed the cap (100). Unconsumed terminal records are never auto-disposed.
+`wackyproc run` automatically retires the oldest terminal records (by `Gen`) when the terminal count exceeds the cap (100), regardless of state; `list` self-heals the same cap before its snapshot.
 
-- **Prune all finished jobs**: Manually dispose all terminal records regardless of consumed state:
+- **Prune all finished jobs**: Manually dispose all terminal records:
   ```bash
   wackyproc prune
-  ```
-- **Unconsume a record**: Clear the consumed marker so a record is protected from auto-disposal:
-  ```bash
-  wackyproc unconsume a1b2
   ```
 - **Force-dispose a stuck record**: `wackyproc remove a1b2` - works on RUNNING records that prune can never clear (the process died or hung outside the supervisor's capture window, so it has no exit and will never go terminal). The process is NOT signaled - stop or kill it first if you want it gone. The record's ID is recorded as disposed and never re-claimed.
 
@@ -130,7 +126,7 @@ wackyproc run wackypub agent <target> prompt --async "...NO_RESPONSE..."
 ```
 
 The caller gets back an 8-character pronounceable slug process ID immediately, then polls with
-`wackyproc list` / `wackyproc wait --for <id>` and retrieves the target's
+`wackyproc list` / `wackyproc wait <id>` and retrieves the target's
 model output from stdout with `wackyproc get <id>`. The NO_RESPONSE suffix is a
 token-saver convention, not a guarantee: a model that ignores it just
 produces normal output, which still lands in stdout where the caller can
@@ -211,8 +207,8 @@ are usually fine to take without asking.
    # Turn 1:
    wackyproc run cargo-build --release
    # Turn 2:
-   wackyproc wait 30
+   wackyproc wait 30 <id>
    wackyproc get <id>
    ```
 3. **Clean Up Finished Jobs**:
-   Run `wackyproc prune` to clean up all terminal processes on demand. `wackyproc run` will also automatically evict consumed terminal processes in creation order once the cap of 100 terminal records is reached.
+   Run `wackyproc prune` to clean up all terminal processes on demand. `wackyproc run` will also automatically retire the oldest terminal processes (by `Gen`) once the cap of 100 terminal records is exceeded, regardless of state.
