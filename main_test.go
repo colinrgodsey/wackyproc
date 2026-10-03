@@ -680,3 +680,84 @@ func TestDescribeCmd_CLI_MissingArgFails(t *testing.T) {
 		t.Fatal("expected error for describe with no id")
 	}
 }
+
+// TestDescribeCmd_CLI_MultiID pins the multi-id form (card item 4 of
+// tasks/wackyproc/list-describe-split): space-separated IDs produce one human block
+// per record and a JSON array of records in --json mode.
+func TestDescribeCmd_CLI_MultiID(t *testing.T) {
+	// describeJSON is a package-level flag var; earlier tests leave it true when they
+	// run describe --json, which would make the human-path capture below emit JSON.
+	describeJSON = false
+	defer func() { describeJSON = false }()
+	tmpDir := t.TempDir()
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	toolsDir := filepath.Join(tmpDir, "tools")
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("mkdir tools: %v", err)
+	}
+	for _, name := range []string{"mt-one", "mt-two"} {
+		tool := "#!/bin/sh\necho done\n"
+		if err := os.WriteFile(filepath.Join(toolsDir, name), []byte(tool), 0755); err != nil {
+			t.Fatalf("write tool: %v", err)
+		}
+	}
+
+	id1, err := proc.Run(tmpDir, "mt-one", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run mt-one: %v", err)
+	}
+	id2, err := proc.Run(tmpDir, "mt-two", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run mt-two: %v", err)
+	}
+	if _, err := proc.Wait(tmpDir, 5); err != nil {
+		t.Fatalf("proc.Wait: %v", err)
+	}
+
+	capture := func(args ...string) string {
+		t.Helper()
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe: %v", err)
+		}
+		origStdout := os.Stdout
+		os.Stdout = w
+		rootCmd.SetArgs(args)
+		execErr := rootCmd.Execute()
+		w.Close()
+		os.Stdout = origStdout
+		if execErr != nil {
+			t.Fatalf("command %v: %v", args, execErr)
+		}
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		return buf.String()
+	}
+
+	// Human path: one block per ID, both IDs present.
+	out := capture("describe", id1, id2)
+	if !strings.Contains(out, "ID:        "+id1) || !strings.Contains(out, "ID:        "+id2) {
+		t.Fatalf("multi-id describe missing one of %s/%s in output:\n%s", id1, id2, out)
+	}
+	if !strings.Contains(out, "Tool:      mt-one") || !strings.Contains(out, "Tool:      mt-two") {
+		t.Fatalf("multi-id describe missing tool names:\n%s", out)
+	}
+
+	// JSON path: array of exactly 2 records.
+	jsonOut := capture("describe", id1, id2, "--json")
+	var infos []map[string]any
+	if err := json.Unmarshal([]byte(jsonOut), &infos); err != nil {
+		t.Fatalf("describe --json not valid JSON array: %v (out: %s)", err, jsonOut)
+	}
+	if len(infos) != 2 {
+		t.Fatalf("expected 2 describe records, got %d", len(infos))
+	}
+}
