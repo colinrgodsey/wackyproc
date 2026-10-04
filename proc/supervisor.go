@@ -22,6 +22,13 @@ func writeRecord(procDir, name, content string) error {
 	return nil
 }
 
+// SuperviseEntrypointEnv marks a process as the DETACHED wackyproc supervisor.
+// launchSupervisor sets it on the __supervise child. proc.Supervise only installs
+// child-subreaper + orphan-reaping for this process: subreaper status is global to
+// the calling process, so an embedded/in-process Supervise call (tests, library
+// consumers) must NOT mutate the embedding process's reparenting semantics.
+const SuperviseEntrypointEnv = "WACKYPROC_SUPERVISE_ENTRYPOINT"
+
 // supervisorStreams holds the open file handles for a supervised tool's I/O.
 type supervisorStreams struct {
 	stdout *os.File
@@ -172,6 +179,24 @@ func Supervise(procDir string) error {
 	}
 	defer streams.Close()
 
+	// Become a child subreaper BEFORE starting the tool, but ONLY in the detached
+	// supervisor process (marked by launchSupervisor). Subreaper status is global to
+	// the calling process: an embedded/in-process Supervise call (tests, library
+	// consumers) must not change the embedding process's reparenting semantics -
+	// doing so would make unrelated orphans reparent to it and zombie there. In the
+	// detached supervisor the CLI has already exited and never waits, so without
+	// subreaper status the tool's OWN children (e.g. a bash wrapper spawning
+	// wackypub) reparent to PID 1 on their parent's death - and a container PID 1
+	// that is plain sh does not reap them, so every completed task leaves defunct
+	// processes (bugs/wackyproc/defunct-process-accumulation). As the subreaper we
+	// adopt them, and reapAdoptedOrphans below reaps the dead ones.
+	isDetachedSupervisor := os.Getenv(SuperviseEntrypointEnv) != ""
+	if isDetachedSupervisor {
+		if err := becomeSubreaper(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to become subreaper, orphaned tool children may be reaped by init: %v\n", err)
+		}
+	}
+
 	cmd, err := startTool(procDir, &meta, streams)
 	if err != nil {
 		return err
@@ -181,7 +206,18 @@ func Supervise(procDir string) error {
 		return err
 	}
 
-	return awaitExit(procDir, cmd)
+	if err := awaitExit(procDir, cmd); err != nil {
+		return err
+	}
+
+	// Drain any adopted orphans that have already exited (WNOHANG) before exiting
+	// ourselves, so the process table does not accumulate defunct entries. Only the
+	// detached supervisor has adopted orphans (it is the subreaper); in-process calls
+	// must not sweep the embedding process's children.
+	if isDetachedSupervisor {
+		reapAdoptedOrphans()
+	}
+	return nil
 }
 
 // exitCodeFromProcessState maps what cmd.Wait reported onto the shell convention: the tool's
