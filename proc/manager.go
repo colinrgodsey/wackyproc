@@ -186,6 +186,7 @@ func launchSupervisor(cwd, procDir string) error {
 
 	cmd := exec.Command(selfBin, "__supervise", procDir)
 	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(), SuperviseEntrypointEnv+"=1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true,
 	}
