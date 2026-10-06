@@ -210,6 +210,24 @@ func CheckLiveness(procDir string, meta *Meta) (Liveness, error) {
 		return lv, nil
 	}
 
+	// 3b. A zombie answers the zero-signal check, so the branch above cannot see
+	// that the tool already exited. Only the supervisor writes exit_code, and only
+	// after reaping, so a live non-zombie supervisor means the record is still
+	// finalizing and the exit code has not been lost. Marking every zombie terminal
+	// would be wrong: a tool that exited microseconds ago is a zombie for exactly as
+	// long as it takes the supervisor to reap it and write exit_code, and the crashed
+	// marker outranks exit_code in CheckLiveness, so the marker would permanently
+	// shadow a status that was about to be correct.
+	if isZombie(lv.PID) {
+		if isSupervisorFinalizing(procDir) {
+			lv.Status = StatusRunning
+			return lv, nil
+		}
+		markCrashed(procDir)
+		lv.Status = StatusCrashed
+		return lv, nil
+	}
+
 	// 4. Start-time verification to detect PID reuse
 	if pidRecycled(lv.PID, meta) {
 		markCrashed(procDir)

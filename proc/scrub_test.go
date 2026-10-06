@@ -215,12 +215,30 @@ func TestStopTerminatesDetachedProcessGroup(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := syscall.Kill(sleeper, 0); err != nil {
-			return // gone, as reported
+		if !processRunnable(sleeper) {
+			return // dead, as reported: reaped, or a zombie whose parent has not waited
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Errorf("Stop reported success but pid %d is still signalable", sleeper)
+	t.Errorf("Stop reported success but pid %d is still running", sleeper)
+}
+
+// processRunnable reports whether pid is still executing. Signal reachability cannot
+// answer this: kill -0 succeeds on a zombie, and when the reparent target for an orphan
+// does not reap, a correctly killed process stays observable as a zombie indefinitely.
+// The state field is the only honest read, so anything but Z that still exists is running.
+func processRunnable(pid int) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return false
+	}
+	content := string(data)
+	lastParen := strings.LastIndex(content, ")")
+	if lastParen == -1 || lastParen+1 >= len(content) {
+		return true
+	}
+	fields := strings.Fields(content[lastParen+1:])
+	return len(fields) > 0 && fields[0] != "Z"
 }
 
 // newDetachedSleeper starts a sleep in its own session and returns its pid. It must not be a
