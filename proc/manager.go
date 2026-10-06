@@ -695,12 +695,10 @@ func waitSetContext(ctx context.Context, cwd string, timeoutSeconds int, all boo
 		// detection latency; the kernel wakes us exactly when a process exits.
 		// Falls back to the polling ramp on unsupported kernels / sandboxes /
 		// non-Linux. A wake is not a verdict - the loop re-runs List +
-		// findCompleted, so the #13 zombie gate (CheckLiveness -> isZombie /
-		// pid-reuse detection) still composes.
-		// Try the pidfd path on the first successful arm only; once it fails for
-		// any reason (unsupported kernel, sandbox EPERM, process-gone ESRCH) fall
-		// back to the polling ramp for the rest of this wait rather than
-		// re-syscalling per tick.
+		// findCompleted, so liveness re-derives from the markers, then the tool-zombie
+		// gate and PID-reuse detection. The zombie gate is the one added in proc/liveness.go
+		// by this change; an earlier revision of this comment credited a #13 gate that
+		// was never implemented, and #16 was built believing it existed.
 		if !pidfdTried && !ForcePollingFallbackForTest {
 			pids, anyPending := runningPidsFor(list, set, terminal)
 			if len(pids) > 0 {
