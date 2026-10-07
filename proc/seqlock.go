@@ -46,7 +46,7 @@ func IsProcessRecordDir(name string) bool {
 // If a process holding the lock was frozen/suspended (e.g. via SIGSTOP or VM pause) for
 // more than 10 seconds, another process may steal the lock by removing the directory and
 // proceeding. In that rare event, two processes could theoretically increment the counter
-// concurrently; the risk is bounded: a rare Gen/ConsumedSeq tie (two lock holders), not
+// concurrently; the risk is bounded: a rare Gen tie (two lock holders), not
 // corruption or a crash. The critical section only reads and writes a single small counter file
 // and executes in a few microseconds, so a 10s wait indicates a crashed or abandoned lock.
 // This bounded recovery is preferable to permanently deadlocking all subsequent process
@@ -88,7 +88,7 @@ func acquireSeqLock(procBaseDir string) (func(), error) {
 }
 
 // nextSeq atomically reads, increments, and persists the monotonic sequence counter under procBaseDir.
-// It is used to assign Meta.Gen on process spawn and Meta.ConsumedSeq on first terminal read.
+// It is used to assign Meta.Gen on process spawn.
 func nextSeq(procBaseDir string) (uint64, error) {
 	seqLockMu.Lock()
 	defer seqLockMu.Unlock()
@@ -105,9 +105,9 @@ func nextSeq(procBaseDir string) (uint64, error) {
 	if err == nil {
 		parsed, parseErr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 		if parseErr != nil {
-			// A present-but-unparseable .seq must not restart the counter at 0: Gen and
-			// ConsumedSeq are what distinguish a fresh record from a stale one, so resuming at
-			// zero makes already-consumed records look unconsumed. Fail loudly and leave the
+			// A present-but-unparseable .seq must not restart the counter at 0: Gen is
+			// what distinguishes older records from newer ones for age-based retirement,
+			// so resuming at zero would re-order records. Fail loudly and leave the
 			// offending file in place for the operator to inspect.
 			return 0, fmt.Errorf("failed to parse %s in %s (found %q): refusing to restart the sequence at 0: %w", SeqFileName, procBaseDir, strings.TrimSpace(string(data)), parseErr)
 		}

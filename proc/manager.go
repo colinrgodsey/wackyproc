@@ -621,6 +621,9 @@ func waitSetContext(ctx context.Context, cwd string, timeoutSeconds int, all boo
 		seen[id] = true
 		set = append(set, id)
 	}
+	if len(set) == 0 {
+		return "", fmt.Errorf("wait requires at least one process ID")
+	}
 	// A missing ID has to be rejected here rather than falling through:
 	// filepath.Join drops empty components, so an empty ID would resolve to the
 	// .proc directory itself - which exists once any process has run - and a

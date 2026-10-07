@@ -64,7 +64,7 @@ var runCmd = &cobra.Command{
 	Short: "Spawn a tool in the background as a detached process",
 	Long: `Spawn a tool from ./tools/<tool> as a detached background process.
 
-Returns the allocated 4-character process ID immediately. The process runs
+Returns the allocated 8-character process ID immediately. The process runs
 detached in its own process group and session, surviving the agent turn.
 Any stdin passed to wackyproc is drained synchronously into .proc/<id>/stdin
 before detaching.`,
@@ -319,7 +319,7 @@ var peekCmd = &cobra.Command{
 	Use:   "peek <proc_id> [--lines N]",
 	Short: "Show the trailing lines of captured stdout and stderr for a process",
 	Long: `Shows the trailing lines of captured stdout and stderr for the specified process ID
-directly through wackyproc's own stdout and stderr without marking the record as consumed.`,
+directly through wackyproc's own stdout and stderr.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// CLI-layer validation fires first to reject invalid flag inputs before resolving cwd or process state.
