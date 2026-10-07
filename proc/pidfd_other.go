@@ -19,11 +19,6 @@ func openPidFD(pid int) (int, error) {
 	return -1, ErrPidFDUnsupported
 }
 
-// waitPidFDs is a no-op on non-Linux.
-func waitPidFDs(pids []int, timeout time.Duration) (bool, []int, error) {
-	return false, nil, ErrPidFDUnsupported
-}
-
 func closePidFDs(fds []int) {}
 
 // PidfdSupportedOnThisPlatform is false on non-Linux.

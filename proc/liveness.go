@@ -101,10 +101,6 @@ func statusFromExitCode(procDir string) (string, *int, bool) {
 	return StatusFailed, code, true
 }
 
-func statusFromTerminal(procDir string) (string, *int, bool) {
-	return statusFromExitCode(procDir)
-}
-
 // isSupervisorFinalizing checks if supervisor is still alive and finalizing exit_code.
 // A zombie supervisor (exited or killed but not yet reaped by its parent) passes the
 // zero-signal check yet can never finalize, so it does not count as finalizing.

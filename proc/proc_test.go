@@ -828,6 +828,38 @@ func TestWait_BareRequiresIDs(t *testing.T) {
 		t.Errorf("expected immediate return, took %v (elapsed)", elapsed)
 	}
 }
+
+// TestWait_EmptyIDsFailFast verifies that passing only empty strings to Wait or WaitAll
+// does not bypass validation, does not block the timeout, and does not panic on WaitAll.
+func TestWait_EmptyIDsFailFast(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	for _, tc := range []struct {
+		name string
+		call func() (string, error)
+	}{
+		{"Wait single empty", func() (string, error) { return proc.Wait(cwd, 600, "") }},
+		{"Wait multiple empty", func() (string, error) { return proc.Wait(cwd, 600, "", "") }},
+		{"WaitAll single empty", func() (string, error) { return proc.WaitAll(cwd, 600, "") }},
+		{"WaitAll multiple empty", func() (string, error) { return proc.WaitAll(cwd, 600, "", "") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			gotID, err := tc.call()
+			elapsed := time.Since(start)
+			if err == nil || !strings.Contains(err.Error(), "at least one process ID") {
+				t.Fatalf("expected a missing-IDs error, got id=%q err=%v", gotID, err)
+			}
+			if gotID != "" {
+				t.Fatalf("expected empty ID, got %q", gotID)
+			}
+			if elapsed > 100*time.Millisecond {
+				t.Errorf("expected immediate return, took %v", elapsed)
+			}
+		})
+	}
+}
+
 func TestWait_FirstCompletedOfMany(t *testing.T) {
 	cwd := setupTestEnv(t)
 	createExecutable(t, cwd, "fast-tool", "sleep 0.2")
@@ -1463,7 +1495,7 @@ func TestPrune(t *testing.T) {
 	procBaseDir := filepath.Join(cwd, proc.ProcDirName)
 	_ = os.MkdirAll(procBaseDir, 0755)
 
-	// Seed 3 terminal records (mix consumed and unconsumed) and 1 running record
+	// Seed 3 terminal records and 1 running record
 	seedProcessRecord(t, cwd, "t001", "tool-a", proc.StatusCompleted, 1)
 	seedProcessRecord(t, cwd, "t002", "tool-b", proc.StatusFailed, 2)
 	seedProcessRecord(t, cwd, "t003", "tool-c", proc.StatusCrashed, 3)
@@ -1539,7 +1571,7 @@ func TestGet_JustRemovedRecordDir(t *testing.T) {
 
 func TestGet_MissingIndividualFiles(t *testing.T) {
 	// 1. Missing stdout: procDir exists, stderr and meta.json exist, stdout removed.
-	// Documented behavior: stdout write is skipped, Get succeeds, meta marked consumed.
+	// Documented behavior: stdout write is skipped, Get succeeds.
 	{
 		cwd := setupTestEnv(t)
 		createExecutable(t, cwd, "tool-out", "echo out; echo err >&2")
@@ -1566,7 +1598,7 @@ func TestGet_MissingIndividualFiles(t *testing.T) {
 	}
 
 	// 2. Missing stderr: procDir exists, stdout and meta.json exist, stderr removed.
-	// Documented behavior: stderr write is skipped, Get succeeds, meta marked consumed.
+	// Documented behavior: stderr write is skipped, Get succeeds.
 	{
 		cwd := setupTestEnv(t)
 		createExecutable(t, cwd, "tool-err", "echo out; echo err >&2")
@@ -1845,7 +1877,7 @@ func TestList_CompactJSONExcludesArgs(t *testing.T) {
 }
 
 // TestDescribe_FullDetailsAndDoesNotConsume verifies describe returns complete args +
-// metadata and never marks the record consumed (Get is the only consumer).
+// metadata.
 func TestDescribe_FullDetailsAndDoesNotConsume(t *testing.T) {
 	cwd := setupTestEnv(t)
 	createExecutable(t, cwd, "bigtool", "exit 0")
