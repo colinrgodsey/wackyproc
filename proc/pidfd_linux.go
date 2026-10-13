@@ -65,25 +65,6 @@ func pidfdPoll(fds []int, timeoutMs int) (int, error) {
 	}
 }
 
-// waitPidFDs arms pidfds for the given pids and blocks until one exits or timeout
-// elapses. Returns true if any exited (caller re-lists to confirm + gate zombies).
-func waitPidFDs(pids []int, timeout time.Duration) (bool, []int, error) {
-	var fds []int
-	for _, pid := range pids {
-		fd, err := openPidFD(pid)
-		if err != nil {
-			closePidFDs(fds)
-			return false, nil, err
-		}
-		fds = append(fds, fd)
-	}
-	if len(fds) == 0 {
-		return false, nil, ErrPidFDUnsupported
-	}
-
-	return waitPidFDsBlocking(fds, timeout)
-}
-
 // waitPidFDsContext waits on pidfds for the pids while honoring ctx cancellation.
 // It polls in bounded slices so a cancel is observed within one slice (100ms) without
 // relying on close()-to-unblock-poll, which is unreliable on Linux while poll is
@@ -133,20 +114,6 @@ func waitPidFDsContext(ctx context.Context, pids []int, timeout time.Duration) (
 		default:
 		}
 	}
-}
-
-// waitPidFDsBlocking is the raw pidfd poll; callers own fd lifecycle.
-func waitPidFDsBlocking(fds []int, timeout time.Duration) (bool, []int, error) {
-	ms := int(timeout / time.Millisecond)
-	if ms < 0 {
-		ms = 0
-	}
-	n, err := pidfdPoll(fds, ms)
-	closePidFDs(fds)
-	if err != nil {
-		return false, nil, err
-	}
-	return n > 0, nil, nil
 }
 
 func closePidFDs(fds []int) {

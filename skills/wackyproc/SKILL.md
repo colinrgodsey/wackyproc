@@ -174,8 +174,7 @@ did not ask for.
 - *Autonomous recovery loop* (for example retry-storm detection) - blocking
   is pre-authorized by the loop's design; `wait` is correct.
 - *Progress visibility without blocking* - `peek` (trailing output) or
-  `list --json` (status and exit codes). Neither consumes the record, and
-  neither holds the turn.
+  `list --json` (status and exit codes); neither holds the turn.
 
 **Operational rule of thumb:** any `wait` longer than ~30 seconds is a
 parent-process decision - do not take it unilaterally. Short waits (<10s)

@@ -70,8 +70,8 @@ func TestStopReportsMissingSignalTarget(t *testing.T) {
 	}
 }
 
-// A present-but-unparseable .seq used to fall through as zero, restarting the Gen and
-// ConsumedSeq sequence that separates fresh records from stale ones.
+// A present-but-unparseable .seq used to fall through as zero, resetting the Gen
+// counter that orders records by age for retirement.
 func TestNextSeqRefusesCorruptSequence(t *testing.T) {
 	base := t.TempDir()
 	seqPath := filepath.Join(base, ".seq")
