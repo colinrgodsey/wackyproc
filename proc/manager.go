@@ -161,6 +161,7 @@ func prepareProcessRecord(cwd, procID, procDir, toolName, toolPath string, args 
 		ToolPath:  toolPath,
 		Args:      args,
 		Cwd:       cwd,
+		AgentDir:  os.Getenv(AgentDirEnv),
 		StartedAt: time.Now().Unix(),
 		Gen:       gen,
 	}
@@ -283,6 +284,7 @@ func Describe(cwd string, procID string) (*DescribeInfo, error) {
 		PGID:       liveness.PGID,
 		ExitCode:   liveness.ExitCode,
 		StartedAt:  meta.StartedAt,
+		Notified:   meta.Notified,
 		StdoutFile: filepath.Join(procDir, StdoutFileName),
 		StderrFile: filepath.Join(procDir, StderrFileName),
 		StdinFile:  stdinFile,
@@ -382,6 +384,7 @@ func List(cwd string) ([]ProcessInfo, error) {
 			PID:       liveness.PID,
 			PGID:      liveness.PGID,
 			ExitCode:  liveness.ExitCode,
+			Notified:  meta.Notified,
 			StartedAt: meta.StartedAt,
 		})
 	}
@@ -397,10 +400,11 @@ func List(cwd string) ([]ProcessInfo, error) {
 }
 
 // Get dumps captured stdout and stderr for procID to the provided writers.
-// It streams output only: the record is not marked in any way, so it stays
-// eligible for cap retirement like any other terminal record. meta.json is
-// existence-checked but never modified: a record whose meta has been disposed
-// concurrently is reported as not found.
+// It streams output, then marks the record notified once it is terminal: an agent that
+// has read a result has been notified, which is what keeps the wake paths from firing
+// for that job again. Marking does not affect cap retirement. meta.json is
+// existence-checked up front, so a record whose meta has been disposed concurrently is
+// still reported as not found.
 func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writer) error {
 	procDir := filepath.Join(cwd, ProcDirName, procID)
 	if _, err := os.Stat(procDir); os.IsNotExist(err) {
@@ -421,6 +425,17 @@ func Get(cwd string, procID string, stdoutWriter io.Writer, stderrWriter io.Writ
 	if stderrData, err := os.ReadFile(stderrPath); err == nil && len(stderrData) > 0 {
 		if _, err := stderrWriter.Write(stderrData); err != nil {
 			return fmt.Errorf("failed to write stderr: %w", err)
+		}
+	}
+
+	// Reading a result out is the notification: the agent has now seen this job finish, so
+	// neither the idle wake nor the end-of-turn piggyback should surface it again. Only a
+	// terminal record counts, because reading partial output from a running job says
+	// nothing about completion. A failed mark degrades to a possible duplicate wake, the
+	// cheaper direction: no completed job is ever lost.
+	if meta, metaErr := readMeta(procDir); metaErr == nil {
+		if liveness, liveErr := CheckLiveness(procDir, &meta); liveErr == nil && isTerminal(liveness.Status) {
+			_ = MarkNotified(procDir)
 		}
 	}
 
@@ -669,6 +684,7 @@ func waitSetContext(ctx context.Context, cwd string, timeoutSeconds int, all boo
 		prevTerminal = terminal
 		if !all {
 			if lastCompleted != "" {
+				markReadNotified(cwd, []string{lastCompleted})
 				return lastCompleted, nil
 			}
 		} else {
@@ -685,6 +701,7 @@ func waitSetContext(ctx context.Context, cwd string, timeoutSeconds int, all boo
 					// last one in caller order so the contract always returns an ID.
 					lastCompleted = set[len(set)-1]
 				}
+				markReadNotified(cwd, set)
 				return lastCompleted, nil
 			}
 		}
