@@ -224,7 +224,7 @@ func Supervise(procDir string) error {
 	// happened, or why none did. Nothing here may alter what the supervisor just recorded:
 	// a hook that cannot run leaves the job un-notified for a manual read.
 	fire := MaybeFireCompletionHooks(meta, procDir)
-	if fire.Skipped != "" {
+	if fire.Skipped != "" && !fire.Quiet {
 		appendHookLog(filepath.Join(procDir, hookLogFileName), "no wake for job "+meta.ID+": "+fire.Skipped)
 	}
 	return nil

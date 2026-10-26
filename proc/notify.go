@@ -163,6 +163,10 @@ func CompletionNotice(meta Meta, status string, exitCode *int) string {
 type HookFireResult struct {
 	Fired   []string
 	Skipped string
+	// Quiet marks a skip that is the ordinary outcome of an unconfigured or already
+	// handled job. Those verdicts are not worth a log line on every process record;
+	// the interesting ones (busy agent, failed probe, broken script) are not quiet.
+	Quiet bool
 }
 
 // MaybeFireCompletionHooks is the idle-wake gate. The supervisor calls it as its last act,
@@ -171,17 +175,17 @@ type HookFireResult struct {
 func MaybeFireCompletionHooks(meta Meta, procDir string) HookFireResult {
 	agentDir := meta.AgentFolder()
 	if agentDir == "" {
-		return HookFireResult{Skipped: errNoAgentDir.Error()}
+		return HookFireResult{Skipped: errNoAgentDir.Error(), Quiet: true}
 	}
 	if isNotified(procDir) {
-		return HookFireResult{Skipped: "already notified"}
+		return HookFireResult{Skipped: "already notified", Quiet: true}
 	}
 	scripts, err := DiscoverCompletionHooks(agentDir)
 	if err != nil {
 		return HookFireResult{Skipped: err.Error()}
 	}
 	if len(scripts) == 0 {
-		return HookFireResult{Skipped: "no " + CompletionHookEvent + " hooks registered"}
+		return HookFireResult{Skipped: "no " + CompletionHookEvent + " hooks registered", Quiet: true}
 	}
 	busy, err := SessionLockBusy(agentDir)
 	if err != nil {
@@ -227,18 +231,19 @@ func MaybeFireCompletionHooks(meta Meta, procDir string) HookFireResult {
 }
 
 func hookEnv(meta Meta, status string, exitCode *int, procDir, noticePath string) ([]string, string) {
+	exit := ""
+	if exitCode != nil {
+		exit = strconv.Itoa(*exitCode)
+	}
 	env := []string{
 		AgentDirEnv + "=" + meta.AgentFolder(),
 		HookEnvProcID + "=" + meta.ID,
 		HookEnvTool + "=" + meta.Tool,
 		HookEnvStatus + "=" + status,
-		HookEnvExitCode + "=",
+		HookEnvExitCode + "=" + exit,
 		HookEnvStdoutFile + "=" + filepath.Join(procDir, StdoutFileName),
 		HookEnvStderrFile + "=" + filepath.Join(procDir, StderrFileName),
 		HookEnvNoticeFile + "=" + noticePath,
-	}
-	if exitCode != nil {
-		env[3] = HookEnvExitCode + "=" + strconv.Itoa(*exitCode)
 	}
 	if bin, err := os.Executable(); err == nil {
 		env = append(env, HookEnvBin+"="+bin)
