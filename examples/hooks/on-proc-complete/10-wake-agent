@@ -1,0 +1,48 @@
+#!/bin/sh
+# Idle wake for wackyproc background jobs - tasks/wackyproc/notify-on-completion (D1).
+#
+# Install: copy to <agentFolder>/hooks/on-proc-complete/ and chmod +x. wackyproc's
+# supervisor runs it, detached, as the last thing it does when a job reaches a terminal
+# state, and only when the owning agent's session lock is free. The supervisor skips
+# rather than queuing while the agent is mid-turn; the record stays un-notified in that
+# case, so a later wackyproc get/wait read, or the end-of-turn piggyback hook once it
+# exists, still surfaces the job.
+#
+# What the gate hands you in the environment:
+#   WACKYPROC_AGENT_DIR    owning agent folder (also your cwd here)
+#   WACKYPROC_PROC_ID      the job that finished
+#   WACKYPROC_TOOL         the tool it ran
+#   WACKYPROC_STATUS       COMPLETED | FAILED | CRASHED
+#   WACKYPROC_EXIT_CODE    exit status, empty when the record has none
+#   WACKYPROC_NOTICE_FILE  rendered wake text (job id, outcome, get command)
+#   WACKYPROC_STDOUT_FILE  / WACKYPROC_STDERR_FILE  captured output paths
+#
+# Two wackypub requirements for talking to yourself:
+#   1. Self-dispatch is allowed only if your own agent id is listed in
+#      <agentFolder>/WACKYPUB_ALLOWED_AGENTS.
+#   2. AGENT2AGENT and WACKYPROC_CALL_CHAIN are stripped below. They are inherited from
+#      the turn that started the job, and the cycle detector would reject a dispatch whose
+#      chain already contains this agent. Stripping them is not a cycle-skip: a self-wake
+#      never trips the guard in the first place, which is why this script does not use
+#      prompt --async or WACKYPROC_SUPERVISED at all.
+
+set -eu
+
+if [ "${WACKYPROC_PROC_ID:-}" = "" ] || [ "${WACKYPROC_AGENT_DIR:-}" = "" ]; then
+	exit 0
+fi
+
+agent_id=$(basename "$WACKYPROC_AGENT_DIR")
+notice=$(cat "$WACKYPROC_NOTICE_FILE")
+
+cd "$WACKYPROC_AGENT_DIR"
+
+if ! command -v wackypub >/dev/null 2>&1; then
+	# Degrade, never wedge: no CLI means no wake, and the job stays readable by hand.
+	exit 0
+fi
+
+env -u AGENT2AGENT -u WACKYPROC_CALL_CHAIN \
+	wackypub agent prompt "$agent_id" "$notice" >/dev/null 2>&1 &
+
+exit 0
