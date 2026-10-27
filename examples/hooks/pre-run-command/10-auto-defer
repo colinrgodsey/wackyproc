@@ -1,0 +1,154 @@
+#!/bin/sh
+# Auto-defer long run_command calls to wackyproc background jobs.
+#
+# Event: pre-run-command (wackypub). Install by placing this script in the
+# owning agent folder, exactly like any other wackypub hook:
+#
+#   <agentFolder>/hooks/pre-run-command/10-auto-defer
+#
+# What it does: when the deferral policy (below) says the call is worth
+# backgrounding, it spawns the SAME command through wackyproc run, captures
+# the 8-character proc ID, and short-circuits the call so the model sees the
+# proc ID and the retrieval path instead of the command output. This script
+# never executes the command inline itself.
+#
+# Deferral policy (P10 - a product decision, so it is an explicit, documented
+# parameter, not a buried heuristic):
+#
+#   WACKYPROC_AUTODEFER_POLICY=off       never defer (kill switch)
+#   WACKYPROC_AUTODEFER_POLICY=marker    defer only calls the caller marked
+#                                        with WACKYPROC_BG=1 in the run_command
+#                                        env (the default when unset)
+#   WACKYPROC_AUTODEFER_POLICY=heuristic defer calls matching the explicit
+#                                        list below (edit it there)
+#   WACKYPROC_AUTODEFER_POLICY=always    defer every call
+#
+# The marker is set per call by the model: run_command env
+# {"WACKYPROC_BG": "1"}.
+#
+# Failure semantics (P5): any problem - no python3, unreadable payload, no
+# wackyproc, spawn failure - ends in silence and exit 0, and the command
+# simply runs inline as if this hook were not installed.
+
+set -u
+
+payload=$(cat)
+[ -n "$payload" ] || exit 0
+
+command -v python3 >/dev/null 2>&1 || exit 0
+
+# Parse the payload. python3 does the JSON; shlex.quote keeps any argv byte
+# safe for the eval below.
+parsed=$(printf '%s' "$payload" | python3 -c '
+import json, shlex, sys
+try:
+    p = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+print("AWK_COMMAND=%s" % shlex.quote(p.get("command", "")))
+print("AWK_CWD=%s" % shlex.quote(p.get("cwd", "")))
+args = p.get("args") or []
+print("AWK_ARGC=%d" % len(args))
+print("AWK_CMDLINE=%s" % shlex.quote(" ".join(shlex.quote(a) for a in args)))
+env = p.get("env") or {}
+print("AWK_MARKER=%s" % shlex.quote(env.get("WACKYPROC_BG", "")))
+') || exit 0
+[ -n "$parsed" ] || exit 0
+eval "$parsed"
+
+[ -n "$AWK_COMMAND" ] || exit 0
+
+# Rebuild the original argv as "$@".
+eval "set -- $AWK_CMDLINE"
+
+# The policy is the operator's explicit choice.
+policy=${WACKYPROC_AUTODEFER_POLICY:-marker}
+case "$policy" in off|marker|heuristic|always) ;; *) exit 0 ;; esac
+
+# Never defer the deferrer or the dispatcher: wackyproc is the background
+# machinery itself, and wackypub calls carry A2A semantics a background job
+# must not change.
+case "$AWK_COMMAND" in wackyproc|wackypub) exit 0 ;; esac
+
+defer=0
+case "$policy" in
+    marker)
+        case "$AWK_MARKER" in 1|true|TRUE|yes|on) defer=1 ;; esac
+        ;;
+    heuristic)
+        # P10: this list IS the heuristic, stated here on purpose. It is
+        # conservative by design - when in doubt, the command runs inline.
+        case "$AWK_COMMAND" in
+            cargo|make|mvn|gradle|docker|pip|pip3) defer=1 ;;
+        esac
+        if [ "$defer" -eq 0 ] && [ "$AWK_ARGC" -gt 0 ]; then
+            first=""
+            for a in "$@"; do
+                first="$a"
+                break
+            done
+            case "$AWK_COMMAND:$first" in
+                go:test|go:build|go:run) defer=1 ;;
+            esac
+        fi
+        if [ "$defer" -eq 0 ]; then
+            case "$AWK_COMMAND" in bash|sh)
+                c_script=""
+                prev=""
+                for a in "$@"; do
+                    if [ "$prev" = "-c" ]; then
+                        c_script="$a"
+                    fi
+                    prev="$a"
+                done
+                # One line on purpose: dash does not let a case pattern list span lines.
+                c_script="${c_script#"${c_script%%[![:space:]]*}"}"
+                case "$c_script" in "go test "*|"go build "*|"go run "*|"cargo build"*|"cargo test"*|"make "*|"npm run "*|"npm install"*|"npm ci"*|"pytest"*|"pip install"*|"pip3 install"*|"mvn "*|"gradle "*|"docker build"*)
+                    defer=1
+                    ;;
+                esac
+                ;;
+            esac
+        fi
+        ;;
+    always)
+        defer=1
+        ;;
+esac
+
+[ "$defer" -eq 1 ] || exit 0
+
+cd "$AWK_CWD" 2>/dev/null || exit 0
+
+WP="$AWK_CWD/tools/wackyproc"
+if [ ! -x "$WP" ]; then
+    WP=$(command -v wackyproc 2>/dev/null) || exit 0
+fi
+[ -n "$WP" ] || exit 0
+
+# Spawn the same command under the supervisor. wackyproc run prints the proc
+# ID and returns immediately; the stdin redirect keeps the payload pipe out
+# of the spawned job.
+id=$("$WP" run "$AWK_COMMAND" "$@" </dev/null 2>/dev/null) || exit 0
+[ -n "$id" ] || exit 0
+
+# P9: the model-visible result names the job and the exact retrieval path.
+python3 -c '
+import json, sys
+proc_id, policy = sys.argv[1], sys.argv[2]
+output = (
+    "[wackyproc auto-defer] This command was not run inline; it is now "
+    "background job " + proc_id + ".\n"
+    "  retrieve result:  wackyproc get " + proc_id + "\n"
+    "  wait for it:      wackyproc wait 30 " + proc_id + "\n"
+    "  peek at output:   wackyproc peek " + proc_id
+)
+action = {
+    "type": "short_circuit",
+    "reason": "auto-defer (" + policy + ")",
+    "output": output,
+}
+print(json.dumps({"action": action}))
+' "$id" "$policy" || exit 0
+
+exit 0
