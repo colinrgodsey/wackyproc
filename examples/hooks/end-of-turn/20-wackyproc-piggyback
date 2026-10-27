@@ -1,0 +1,31 @@
+#!/bin/sh
+# End-of-turn piggyback for wackyproc jobs - D2 of tasks/wackyproc/notify-on-completion.
+#
+# Install: copy to <agentFolder>/hooks/end-of-turn/ and chmod +x. wackypub runs it when a
+# turn reaches its end, with the end-of-turn payload on stdin. The leading number is chain
+# order; any 10-* hook of yours runs first.
+#
+# What it covers: the case the idle wake deliberately skips. When a job finishes while this
+# agent is mid-turn, wackyproc's supervisor skips the wake rather than queueing behind the
+# live turn, and the job stays un-notified. This hook is that second chance: at the end of
+# the turn it hands the finished jobs over, and the turn continues once to deal with them,
+# bounded by wackypub's D88 auto-continuation budget.
+#
+# The rule that matters: wackypub discards a continuation on nine of its ten end-of-turn
+# paths (aborted turns, the failure breaker, deferred images, an exhausted budget) and says
+# so with can_continue=false. Asking there would consume the notification and deliver
+# nothing, so wackyproc reports nothing and leaves every record un-notified for a later turn.
+# That decision lives in wackyproc (proc/piggyback.go) where it is tested, not here.
+#
+# Requires a wackypub that has the end-of-turn hook event (wackypub#128). On an older
+# wackypub nothing calls this script, and the supervisor idle wake stays the only path.
+# Failure is inert by design: no wackyproc on PATH, no records, an unreadable .proc, a
+# garbage payload - all print {} and the turn ends exactly as it would have.
+
+if ! command -v wackyproc >/dev/null 2>&1; then
+	printf '{}\n'
+	exit 0
+fi
+
+# stdin carries the payload and passes straight through to the command that decides.
+exec wackyproc end-of-turn

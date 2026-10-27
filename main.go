@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 
@@ -452,6 +453,39 @@ var skillCmd = &cobra.Command{
 	},
 }
 
+var endOfTurnCmd = &cobra.Command{
+	Use:   "end-of-turn",
+	Short: "Answer a wackypub end-of-turn hook: report this agent's un-notified completions",
+	Long: `Reads a wackypub end-of-turn payload from stdin and prints the hook output JSON for
+wackypub to act on. This is the command behind an end-of-turn hook script, not a command for
+people to type.
+
+When the payload says the turn can continue, the finished jobs this agent has not been told
+about are reported in a continuation request and marked notified. When it says the turn is
+notify-only - aborted turns, the failure breaker, deferred images, an exhausted
+auto-continuation budget - wackypub discards the request, so nothing is reported and nothing
+is marked: the completions stay pending for the next turn rather than being announced to
+nobody. With nothing pending it prints {} and the turn ends exactly as it would have.`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		payload, err := io.ReadAll(cmd.InOrStdin())
+		if err != nil {
+			return fmt.Errorf("failed to read end-of-turn payload: %w", err)
+		}
+		res := proc.EndOfTurnPiggyback(cwd, payload, cmd.ErrOrStderr())
+		if len(res.Surfaced) > 0 {
+			fmt.Fprintf(cmd.ErrOrStderr(), "wackyproc end-of-turn: handed over %d job(s): %s\n", len(res.Surfaced), strings.Join(res.Surfaced, ", "))
+		} else if res.Skipped != "" {
+			fmt.Fprintf(cmd.ErrOrStderr(), "wackyproc end-of-turn: %s\n", res.Skipped)
+		}
+		return proc.WriteHookOutput(cmd.OutOrStdout(), res.Output)
+	},
+}
+
 func init() {
 	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output process list as JSON")
 	describeCmd.Flags().BoolVar(&describeJSON, "json", false, "Output describe records as JSON")
@@ -475,6 +509,7 @@ func init() {
 
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(listCmd)
+	rootCmd.AddCommand(endOfTurnCmd)
 	rootCmd.AddCommand(describeCmd)
 	rootCmd.AddCommand(waitCmd)
 	rootCmd.AddCommand(getCmd)
