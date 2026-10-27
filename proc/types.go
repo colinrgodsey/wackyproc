@@ -45,14 +45,22 @@ const (
 
 // Meta records metadata about a spawned background process.
 type Meta struct {
-	ID        string   `json:"id"`
-	Tool      string   `json:"tool"`
-	ToolPath  string   `json:"tool_path"`
-	Args      []string `json:"args"`
-	Cwd       string   `json:"cwd"`
-	StartedAt int64    `json:"started_at"`
-	StartTime string   `json:"start_time,omitempty"`
-	Gen       uint64   `json:"gen"`
+	ID       string   `json:"id"`
+	Tool     string   `json:"tool"`
+	ToolPath string   `json:"tool_path"`
+	Args     []string `json:"args"`
+	Cwd      string   `json:"cwd"`
+	// AgentDir is the owning agent folder when the caller named one through AgentDirEnv.
+	// Empty means the run-time cwd was the agent folder, which is how wackypub dispatches
+	// tools.
+	AgentDir  string `json:"agent_dir,omitempty"`
+	StartedAt int64  `json:"started_at"`
+	StartTime string `json:"start_time,omitempty"`
+	Gen       uint64 `json:"gen"`
+	// Notified records that this job completion has been surfaced to the owning agent by
+	// any path: a manual get/wait read, the idle wake, or the end-of-turn piggyback. It is
+	// the single guard against surfacing the same completion twice.
+	Notified bool `json:"notified,omitempty"`
 }
 
 // ProcessInfo represents the user-visible status of a process. Args is deliberately
@@ -68,6 +76,9 @@ type ProcessInfo struct {
 	PGID      int      `json:"pgid,omitempty"`
 	ExitCode  *int     `json:"exit_code,omitempty"`
 	StartedAt int64    `json:"started_at"`
+	// Notified mirrors Meta.Notified: operators and hook scripts decide what still needs
+	// surfacing from list output, so the flag has to be visible there.
+	Notified bool `json:"notified,omitempty"`
 }
 
 // DescribeInfo is the full-detail view of ONE process record, served by Describe and the
@@ -87,4 +98,7 @@ type DescribeInfo struct {
 	StdoutFile string   `json:"stdout_file"`
 	StderrFile string   `json:"stderr_file"`
 	StdinFile  string   `json:"stdin_file,omitempty"`
+	// Notified mirrors Meta.Notified: operators and hook scripts decide what still needs
+	// surfacing from list output, so the flag has to be visible there.
+	Notified bool `json:"notified,omitempty"`
 }

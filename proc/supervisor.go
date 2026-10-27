@@ -217,6 +217,16 @@ func Supervise(procDir string) error {
 	if isDetachedSupervisor {
 		reapAdoptedOrphans()
 	}
+
+	// This is the only moment anything notices that the job finished: wackyproc has no
+	// daemon. The wake gate decides in-process whether an idle-wake hook runs, and every
+	// verdict lands in the record hook.log so an operator can reconstruct why a turn
+	// happened, or why none did. Nothing here may alter what the supervisor just recorded:
+	// a hook that cannot run leaves the job un-notified for a manual read.
+	fire := MaybeFireCompletionHooks(meta, procDir)
+	if fire.Skipped != "" && !fire.Quiet {
+		appendHookLog(filepath.Join(procDir, hookLogFileName), "no wake for job "+meta.ID+": "+fire.Skipped)
+	}
 	return nil
 }
 
