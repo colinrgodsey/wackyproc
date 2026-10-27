@@ -59,6 +59,48 @@ remedy is the existing kill signals - `wackyproc stop <id>` (SIGTERM, then
 SIGKILL after the grace period) or `wackyproc kill <id>` (immediate
 SIGKILL of the whole process group).
 
+## Hooks
+
+wackyproc ships one wackypub hook script: `examples/hooks/pre-run-command/10-auto-defer`. It
+consumes wackypub's `pre-run-command` event and can hand a `run_command` call to
+`wackyproc run` instead of letting it execute inline. Wackypub core stays unaware of
+wackyproc: the integration is entirely this script plus the agent's own `hooks/` directory.
+
+Install (strictly opt-in per agent, same convention as the other wackypub hooks):
+
+    cp examples/hooks/pre-run-command/10-auto-defer <agentFolder>/hooks/pre-run-command/
+    chmod +x <agentFolder>/hooks/pre-run-command/10-auto-defer
+
+When the policy decides to defer, the call is spawned through `wackyproc run` (same tool,
+same args, agent folder as cwd) and the model receives the proc ID instead of output:
+
+    [wackyproc auto-defer] This command was not run inline; it is now background job <id>.
+      retrieve result:  wackyproc get <id>
+      wait for it:      wackyproc wait 30 <id>
+      peek at output:   wackyproc peek <id>
+
+### Deferral policy
+
+The decision is an explicit, documented parameter, not a buried heuristic:
+
+    WACKYPROC_AUTODEFER_POLICY=off       never defer (kill switch)
+    WACKYPROC_AUTODEFER_POLICY=marker    only calls the caller marked WACKYPROC_BG=1
+                                         in the run_command env (default when unset)
+    WACKYPROC_AUTODEFER_POLICY=heuristic calls matching the explicit list in the script
+    WACKYPROC_AUTODEFER_POLICY=always    every call
+
+Which policy to run is a product decision (card
+tasks/wackyproc/hook-integration-auto-defer-background, P10); the heuristic list lives in
+the script on purpose, so it is edited in one place. The `wackyproc` and `wackypub` tools
+are never deferred, under any policy.
+
+### Failure behavior
+
+Any failure (no python3, unreadable payload, no wackyproc, spawn error) makes the hook
+silent and the command simply runs inline, as if the hook were not installed. The hook
+never alters a command's exit status or captured output, and a woken result is always
+retrievable with `wackyproc get`/`wait` on the printed ID.
+
 ## Process-group isolation
 
 Stop, crash detection, and liveness all operate on the process *group*, not the PID: `stop` signals the group so grandchildren die with the child, and a record is only `RUNNING` while its group is alive. This is what makes `stop` reliable against multi-process trees (`npx → node → server`) that bare-PID management would orphan.

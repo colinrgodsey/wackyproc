@@ -21,6 +21,19 @@ Use `wackyproc run` instead of synchronous `run_command` for:
 
 ---
 
+## Auto-Defer Hook (pre-run-command)
+
+If the agent has `hooks/pre-run-command/10-auto-defer` installed (README, "Hooks" section),
+a `run_command` call may come back as a background job instead of output:
+
+- The response starts with `[wackyproc auto-defer]` and names the proc ID. The command is
+  now running in the background; it was not executed inline.
+- Retrieve it with the usual `wackyproc wait` / `get` / `peek` on that ID (workflow below);
+  nothing else is needed.
+- Under the default `marker` policy the model opts in per call: pass env
+  `{"WACKYPROC_BG": "1"}` to `run_command` for anything that may block (long builds, test
+  suites, other agents' turns).
+
 ## Tool Resolution & Security Boundaries
 
 `wackyproc` strictly resolves target tools against `./tools/<tool>` in the current working directory:
