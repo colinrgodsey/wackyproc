@@ -30,9 +30,20 @@ a `run_command` call may come back as a background job instead of output:
   now running in the background; it was not executed inline.
 - Retrieve it with the usual `wackyproc wait` / `get` / `peek` on that ID (workflow below);
   nothing else is needed.
-- Under the default `marker` policy the model opts in per call: pass env
+- Under the default `marker` policy (`WACKYPROC_AUTODEFER_POLICY=marker`) the model opts in per call: pass env
   `{"WACKYPROC_BG": "1"}` to `run_command` for anything that may block (long builds, test
-  suites, other agents' turns).
+  suites, other agents' turns). Other policies (`off`, `heuristic`, `always`) are configured via `WACKYPROC_AUTODEFER_POLICY`.
+
+## Completion Notification Hooks (`on-proc-complete` & `end-of-turn`)
+
+When an agent has the completion hooks installed (`hooks/on-proc-complete/10-wake-agent` and/or `hooks/end-of-turn/20-wackyproc-piggyback`), finished background jobs can be delivered automatically without manual polling:
+
+- **The `notified` flag (single source of truth)**: Every record in `.proc/<id>/meta.json` tracks `"notified": true` (exposed in `wackyproc list --json` and `wackyproc describe --json`). It starts `false` and is set `true` by whichever path surfaces the completion first:
+  1. Manual `wackyproc get <id>` on a terminal job or `wackyproc wait` returning a terminal job (`peek`, `list`, and `describe` never set `notified`).
+  2. **Idle wake (`on-proc-complete`)**: When a job reaches a terminal state and the owning agent's `session.lock` is **free**, the supervisor fires `hooks/on-proc-complete/10-wake-agent` to wake the agent with a fresh turn and marks the record `notified: true`. If `session.lock` is **held** (agent is mid-turn), the supervisor **skips rather than queuing** and leaves `notified: false`.
+  3. **End-of-turn piggyback (`end-of-turn`)**: When the active turn ends on a path where `can_continue` is `true`, `20-wackyproc-piggyback` (`wackyproc end-of-turn`) finds all terminal records with `notified: false`, marks them `notified: true`, and requests a D88-bounded continuation turn (`<CONTINUATION reason="wackyproc-piggyback">`). On notify-only turn endings (`can_continue: false`), records stay `notified: false` for the next turn.
+- **What a woken or continued turn looks like**: Both wake paths hand you the job's `id`, `tool`, terminal `status`, `exit` code, and the exact retrieval commands (`wackyproc get <id>` and `wackyproc describe <id>`). Run `wackyproc get <id>` to read the captured stdout/stderr.
+- **No double-surface**: Because manual `get`/`wait` sets `notified: true` on terminal records, reading a finished job yourself suppresses both hook paths for that job.
 
 ## Tool Resolution & Security Boundaries
 
@@ -86,7 +97,7 @@ Read the full captured stdout and stderr streams:
 ```bash
 wackyproc get a1b2
 ```
-`wackyproc get` streams output through standard stdout and stderr. In `wackypub`, large output is automatically captured into scratchpad entries. `get` is a pure stream: it marks nothing, and retrieving output has no effect on the record's lifetime.
+`wackyproc get` streams output through standard stdout and stderr. In `wackypub`, large output is automatically captured into scratchpad entries. When the process is in a terminal state (`COMPLETED`, `FAILED`, `CRASHED`), `get` (like `wait`) marks the record `notified: true` so completion hooks do not surface it a second time. Reading partial output while a job is still `RUNNING` does not mark it notified, and retrieving output has no effect on the record's retention lifetime.
 
 ### 5. Peek at Latest Output (Without Full Retrieval)
 Check a long-running job's latest output cheaply without pulling a full dump:
@@ -180,8 +191,7 @@ did not ask for.
 **Worked examples:**
 
 - *"Run the build and let me know when it's done"* - the user is elsewhere.
-  Background the build, then check `list --json` or `get` on a later turn
-  and report completion; do **not** call `wait`.
+  Background the build (`wackyproc run` or `WACKYPROC_BG=1` with `10-auto-defer`), then either let the completion hooks (`on-proc-complete` / `end-of-turn`) wake you when it finishes or check `list --json` / `get` on a later turn and report completion; do **not** call `wait`. (If you read a finished job manually with `get` or `wait`, its `notified` flag is set `true` so the hooks will not surface it again.)
 - *"Run the build, I am waiting"* - the user is explicitly waiting.
   `wait N` is correct, with N chosen against the user's perceived tolerance.
 - *Autonomous recovery loop* (for example retry-storm detection) - blocking
