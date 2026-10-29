@@ -102,16 +102,20 @@ func TestDiscoverCompletionHooksOrderAndFilter(t *testing.T) {
 	}
 }
 
-func TestCompletionNoticeNamesJobAndRetrievalCommand(t *testing.T) {
-	code := 3
-	notice := proc.CompletionNotice(proc.Meta{ID: "abcd1234", Tool: "build-tool"}, proc.StatusFailed, &code)
-	for _, want := range []string{"abcd1234", "build-tool", proc.StatusFailed, "wackyproc get abcd1234", "3"} {
-		if !strings.Contains(notice, want) {
-			t.Errorf("notice missing %q; got:\n%s", want, notice)
+// TestCompletionNoticeIsOneLineWithTheID pins the format Colin asked for: the job ID is
+// the payload, and the retrieval verbs are not spelled out on every wake.
+func TestCompletionNoticeIsOneLineWithTheID(t *testing.T) {
+	notice := proc.CompletionNotice(proc.Meta{ID: "abcd1234", Tool: "build-tool"})
+	want := "[wackyproc] A background task has finished: abcd1234"
+	if notice != want {
+		t.Errorf("notice must match the one-line format exactly, got %q want %q", notice, want)
+	}
+	for _, absent := range []string{"\n", "tool:", "status:", "exit:", "wackyproc get", "describe"} {
+		if strings.Contains(notice, absent) {
+			t.Errorf("notice must not carry the verbose field %q again, got %q", absent, notice)
 		}
 	}
 }
-
 func TestSessionLockBusyTracksAnotherHolder(t *testing.T) {
 	agentDir := t.TempDir()
 	if busy, err := proc.SessionLockBusy(agentDir); err != nil || busy {
@@ -170,8 +174,8 @@ func TestIdleWakeFiresWhenAgentIsIdle(t *testing.T) {
 	if noticeErr != nil {
 		t.Fatalf("the gate must leave the notice text for the woken turn: %v", noticeErr)
 	}
-	if !strings.Contains(string(noticeData), "wackyproc get "+id) {
-		t.Errorf("notice must name the retrieval command, got %s", noticeData)
+	if want := "[wackyproc] A background task has finished: " + id; strings.TrimSpace(string(noticeData)) != want {
+		t.Errorf("the woken turn must be handed the one-line notice naming the job, want %q got %q", want, noticeData)
 	}
 
 	info, err := proc.Describe(cwd, id)

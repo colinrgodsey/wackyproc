@@ -136,25 +136,14 @@ func leadingNumber(name string) (int64, bool) {
 	return n, true
 }
 
-// CompletionNotice is the text a woken turn is handed. It names the job, the outcome and the
-// exact retrieval command: a turn that starts with no way to reconstruct why it started is a
-// failure even when the mechanism works.
-func CompletionNotice(meta Meta, status string, exitCode *int) string {
-	var b strings.Builder
-	b.WriteString("[wackyproc] A background job you started finished, and nothing else was running, so this turn woke up to handle it.\n")
-	fmt.Fprintf(&b, "  id:      %s\n", meta.ID)
-	tool := meta.Tool
-	if tool == "" {
-		tool = "(unknown)"
-	}
-	fmt.Fprintf(&b, "  tool:    %s\n", tool)
-	fmt.Fprintf(&b, "  status:  %s\n", status)
-	if exitCode != nil {
-		fmt.Fprintf(&b, "  exit:    %d\n", *exitCode)
-	}
-	fmt.Fprintf(&b, "  result:  wackyproc get %s\n", meta.ID)
-	fmt.Fprintf(&b, "  detail:  wackyproc describe %s\n", meta.ID)
-	return b.String()
+// CompletionNotice is the text a woken turn is handed: one line, with the job ID as the
+// whole payload. Everything else about the job (tool, status, exit code, captured
+// output) belongs to wackyproc get and describe, which a turn that has the ID can reach
+// on its own, so repeating it here only spent context on every wake. The full verdict
+// is still recorded in the record's hook.log for an operator.
+// The ID is the payload, so it is the one thing this must never lose.
+func CompletionNotice(meta Meta) string {
+	return "[wackyproc] A background task has finished: " + meta.ID
 }
 
 // HookFireResult reports one completion-hook decision. Skipped is empty only when at least
@@ -202,7 +191,7 @@ func MaybeFireCompletionHooks(meta Meta, procDir string) HookFireResult {
 		exitCode = liveness.ExitCode
 	}
 
-	notice := CompletionNotice(meta, status, exitCode)
+	notice := CompletionNotice(meta)
 	noticePath := filepath.Join(procDir, noticeFileName)
 	if err := os.WriteFile(noticePath, []byte(notice), 0o644); err != nil {
 		return HookFireResult{Skipped: fmt.Sprintf("cannot write completion notice: %v", err)}
