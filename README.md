@@ -143,15 +143,9 @@ chmod +x <agentFolder>/hooks/on-proc-complete/10-wake-agent
     - **Lock held (agent is mid-turn)**: **Skips rather than queuing** (`agent is mid-turn: wake skipped rather than queued, job left un-notified` in `.proc/<id>/hook.log`) and leaves `notified: false`. Queuing a second turn behind an active turn is the wrong behavior when the `end-of-turn` piggyback hook (or a manual read in the current turn) can surface the completion inside the turn already running.
 - **Hook environment**: Scripts receive `WACKYPROC_AGENT_DIR`, `WACKYPROC_PROC_ID`, `WACKYPROC_TOOL`, `WACKYPROC_STATUS`, `WACKYPROC_EXIT_CODE`, `WACKYPROC_STDOUT_FILE`, `WACKYPROC_STDERR_FILE`, `WACKYPROC_NOTICE_FILE`, and `WACKYPROC_BIN`.
 - **Self-wake transport (P8)**: `10-wake-agent` strips `AGENT2AGENT` and `WACKYPUB_CALL_CHAIN` from the environment (so an inherited A2A call chain from the turn that spawned the job cannot cause `wackypub`'s cycle detector to reject the self-dispatch) and invokes `wackypub agent prompt <agent_id> "<notice>"` in the background. Because the wake is a fresh top-level turn targeting the agent's own ID (which must be listed in `<agentFolder>/WACKYPUB_ALLOWED_AGENTS`), it deliberately does **not** use `--async` or `WACKYPROC_SUPERVISED`.
-- **What the woken turn sees (P9)**: The prompt text (`CompletionNotice`) names the job and exact retrieval commands:
+- **What the woken turn sees (P9)**: The prompt text (`CompletionNotice`) is one line, naming only the job ID - everything else about the job (tool, status, exit code, captured output) is a `wackyproc get`/`wait`/`peek` away, which a turn that has the ID can reach on its own, so the notice doesn't spend context repeating it:
   ```text
-  [wackyproc] A background job you started finished, and nothing else was running, so this turn woke up to handle it.
-    id:      <id>
-    tool:    <tool>
-    status:  COMPLETED
-    exit:    0
-    result:  wackyproc get <id>
-    detail:  wackyproc describe <id>
+  [wackyproc] A background task has finished: <id>
   ```
 - **Failure semantics (P5)**: Missing hook directory, failed lock probe, script error, or missing `wackypub` binary never blocks the supervisor or alters the job's exit status or captured output. Non-quiet skip reasons are recorded in `.proc/<id>/hook.log`.
 

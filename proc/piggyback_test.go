@@ -41,6 +41,7 @@ func piggybackAwaitTerminal(t *testing.T, cwd, id string) {
 func finishedJob(t *testing.T, toolName string) (string, string) {
 	t.Helper()
 	cwd := setupTestEnv(t)
+	t.Setenv(proc.AgentDirEnv, cwd)
 	createExecutable(t, cwd, toolName, "echo finished")
 	id, err := proc.Run(cwd, toolName, nil, nil)
 	if err != nil {
@@ -149,6 +150,7 @@ func TestPiggybackQuietWhenNothingPending(t *testing.T) {
 
 func TestPiggybackIgnoresRunningJobs(t *testing.T) {
 	cwd := setupTestEnv(t)
+	t.Setenv(proc.AgentDirEnv, cwd)
 	createExecutable(t, cwd, "pig-sleep", "sleep 20")
 	id, err := proc.Run(cwd, "pig-sleep", nil, nil)
 	if err != nil {
@@ -221,6 +223,7 @@ func TestPiggybackOutputIsWackypubHookShape(t *testing.T) {
 // surfaces the job first, the other must stay silent, because the flag is shared.
 func TestPiggybackComposesWithIdleWake(t *testing.T) {
 	cwd := setupTestEnv(t)
+	t.Setenv(proc.AgentDirEnv, cwd)
 	createExecutable(t, cwd, "pig-wake", "echo finished")
 	dump := filepath.Join(cwd, "woke.txt")
 	writeCompletionHook(t, cwd, "10-wake.sh", "echo woke >> \"$DUMP\"")
