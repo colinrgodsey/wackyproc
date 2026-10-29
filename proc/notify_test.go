@@ -146,6 +146,7 @@ func TestSessionLockBusyTracksAnotherHolder(t *testing.T) {
 // owning agent is not mid-turn wakes it, and the wake says which job it is about.
 func TestIdleWakeFiresWhenAgentIsIdle(t *testing.T) {
 	cwd := setupTestEnv(t)
+	t.Setenv(proc.AgentDirEnv, cwd)
 	createExecutable(t, cwd, "wake-tool", "echo finished")
 	dump := filepath.Join(cwd, "woke.txt")
 	writeCompletionHook(t, cwd, "10-wake.sh", ""+
@@ -191,6 +192,7 @@ func TestIdleWakeFiresWhenAgentIsIdle(t *testing.T) {
 // the job stays un-notified so a manual read still surfaces it.
 func TestIdleWakeSkipsWhileAgentIsMidTurn(t *testing.T) {
 	cwd := setupTestEnv(t)
+	t.Setenv(proc.AgentDirEnv, cwd)
 	createExecutable(t, cwd, "busy-tool", "echo finished")
 	dump := filepath.Join(cwd, "woke-while-busy.txt")
 	writeCompletionHook(t, cwd, "10-wake.sh", "echo woke >> \"$DUMP\"")
@@ -229,6 +231,7 @@ func TestIdleWakeSkipsWhileAgentIsMidTurn(t *testing.T) {
 // must not surface the same completion again.
 func TestManualReadSuppressesBothPaths(t *testing.T) {
 	cwd := setupTestEnv(t)
+	t.Setenv(proc.AgentDirEnv, cwd)
 	createExecutable(t, cwd, "read-tool", "echo result")
 	dump := filepath.Join(cwd, "woke-after-read.txt")
 	t.Setenv("DUMP", dump)
@@ -292,6 +295,7 @@ func (noopWriter) Write(p []byte) (int, error) { return len(p), nil }
 // the caller the completed job, which is notification, and must suppress the wake.
 func TestWaitMarksCompletionAsNotified(t *testing.T) {
 	cwd := setupTestEnv(t)
+	t.Setenv(proc.AgentDirEnv, cwd)
 	createExecutable(t, cwd, "quick-tool", "echo done")
 
 	id, err := proc.Run(cwd, "quick-tool", nil, nil)
