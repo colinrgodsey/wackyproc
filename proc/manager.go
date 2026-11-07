@@ -589,6 +589,10 @@ func waitPollIntervalMs(pollsSoFar int) int {
 // platform.
 var ForcePollingFallbackForTest bool
 
+// ErrNothingToWaitFor indicates an any-mode wait was called when no background
+// processes were running at call time.
+var ErrNothingToWaitFor = errors.New("nothing to wait for")
+
 // Wait is the context-less first-completed form of WaitContext.
 func Wait(cwd string, timeoutSeconds int, ids ...string) (string, error) {
 	return WaitContext(context.Background(), cwd, timeoutSeconds, ids...)
@@ -605,6 +609,10 @@ func WaitAll(cwd string, timeoutSeconds int, ids ...string) (string, error) {
 // is returned immediately. If the deadline passes first, WaitContext returns
 // ("", nil) with no error; a listed ID with no record is an error.
 //
+// When no process IDs are specified, WaitContext waits for any process running
+// at call time. If no processes are eligible (running) at entry, it returns
+// ("", ErrNothingToWaitFor) immediately.
+//
 // The loop re-runs List each tick, so terminal detection is the same liveness
 // scan as wackyproc list. On Linux it arms one pidfd per listed running PID
 // and falls back to the polling ramp when the kernel cannot deliver a wake;
@@ -615,7 +623,9 @@ func WaitContext(ctx context.Context, cwd string, timeoutSeconds int, ids ...str
 
 // WaitAllContext blocks until every listed process is in a terminal state and
 // returns the ID of the last completed process (the one that satisfied the
-// barrier). It returns ("", nil) if the deadline passes first.
+// barrier). When no process IDs are specified, it waits until all processes
+// running at call time reach a terminal state, or returns ("", ErrNothingToWaitFor)
+// immediately if there are none. It returns ("", nil) if the deadline passes first.
 func WaitAllContext(ctx context.Context, cwd string, timeoutSeconds int, ids ...string) (string, error) {
 	return waitSetContext(ctx, cwd, timeoutSeconds, true, ids...)
 }
@@ -623,31 +633,44 @@ func WaitAllContext(ctx context.Context, cwd string, timeoutSeconds int, ids ...
 // waitSetContext is the shared loop behind WaitContext (first completed) and
 // WaitAllContext (barrier).
 func waitSetContext(ctx context.Context, cwd string, timeoutSeconds int, all bool, ids ...string) (string, error) {
+	var set []string
 	if len(ids) == 0 {
-		return "", fmt.Errorf("wait requires at least one process ID")
-	}
-	// Dedupe, preserving caller order.
-	seen := make(map[string]bool, len(ids))
-	set := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if id == "" || seen[id] {
-			continue
+		initList, err := List(cwd)
+		if err != nil {
+			return "", err
 		}
-		seen[id] = true
-		set = append(set, id)
-	}
-	if len(set) == 0 {
-		return "", fmt.Errorf("wait requires at least one process ID")
-	}
-	// A missing ID has to be rejected here rather than falling through:
-	// filepath.Join drops empty components, so an empty ID would resolve to the
-	// .proc directory itself - which exists once any process has run - and a
-	// wait with nothing named would block the full timeout instead of failing
-	// fast.
-	procBaseDir := filepath.Join(cwd, ProcDirName)
-	for _, id := range set {
-		if _, err := os.Stat(filepath.Join(procBaseDir, id)); os.IsNotExist(err) {
-			return "", fmt.Errorf("process %q not found", id)
+		for _, p := range initList {
+			if !isTerminal(p.Status) {
+				set = append(set, p.ID)
+			}
+		}
+		if len(set) == 0 {
+			return "", ErrNothingToWaitFor
+		}
+	} else {
+		// Dedupe, preserving caller order.
+		seen := make(map[string]bool, len(ids))
+		set = make([]string, 0, len(ids))
+		for _, id := range ids {
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			set = append(set, id)
+		}
+		if len(set) == 0 {
+			return "", fmt.Errorf("wait requires at least one process ID")
+		}
+		// A missing ID has to be rejected here rather than falling through:
+		// filepath.Join drops empty components, so an empty ID would resolve to the
+		// .proc directory itself - which exists once any process has run - and a
+		// wait with nothing named would block the full timeout instead of failing
+		// fast.
+		procBaseDir := filepath.Join(cwd, ProcDirName)
+		for _, id := range set {
+			if _, err := os.Stat(filepath.Join(procBaseDir, id)); os.IsNotExist(err) {
+				return "", fmt.Errorf("process %q not found", id)
+			}
 		}
 	}
 
