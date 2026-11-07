@@ -3,6 +3,7 @@ package proc_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -524,8 +525,8 @@ func TestSkill_FileContent(t *testing.T) {
 	if !strings.Contains(skillStr, "--all") {
 		t.Errorf("expected skill to document the --all barrier")
 	}
-	if !strings.Contains(skillStr, "the old bare any-mode wait is removed") {
-		t.Errorf("expected skill to document the any-mode removal")
+	if !strings.Contains(skillStr, "nothing to wait for") {
+		t.Errorf("expected skill to document 'nothing to wait for' immediate return")
 	}
 	if strings.Contains(skillStr, "(recorded as 137)") {
 		t.Errorf("expected skill to drop obsolete '(recorded as 137)'")
@@ -810,22 +811,109 @@ exit 0
 	}
 }
 
-// TestWait_BareRequiresIDs pins the removal of the bare any-mode wait: a wait
-// with no process IDs fails fast instead of blocking the timeout.
-func TestWait_BareRequiresIDs(t *testing.T) {
+// TestWait_NoTrackedProcesses_ReturnsImmediately pins acceptance 1: an any-mode wait
+// with ZERO tracked processes has nothing eligible by definition, so it returns
+// immediately with ErrNothingToWaitFor instead of blocking the full timeout.
+func TestWait_NoTrackedProcesses_ReturnsImmediately(t *testing.T) {
 	cwd := setupTestEnv(t)
 
 	start := time.Now()
 	gotID, err := proc.Wait(cwd, 600)
 	elapsed := time.Since(start)
-	if err == nil || !strings.Contains(err.Error(), "at least one process ID") {
-		t.Fatalf("expected a missing-IDs error, got id=%q err=%v", gotID, err)
+
+	if !errors.Is(err, proc.ErrNothingToWaitFor) {
+		t.Fatalf("expected ErrNothingToWaitFor with no tracked processes, got %v", err)
 	}
 	if gotID != "" {
 		t.Fatalf("expected empty ID, got %q", gotID)
 	}
 	if elapsed > 100*time.Millisecond {
 		t.Errorf("expected immediate return, took %v (elapsed)", elapsed)
+	}
+}
+
+// TestWait_AnyMode_NoEligible_ReturnsImmediately pins acceptance 1+2: an any-mode wait
+// with ZERO eligible (running-at-entry) processes returns immediately instead of
+// burning the timeout. Covers both the empty-store case and the only-terminal case.
+func TestWait_AnyMode_NoEligible_ReturnsImmediately(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	// Acceptance 1: zero processes at all.
+	start := time.Now()
+	gotID, err := proc.Wait(cwd, 600)
+	if !errors.Is(err, proc.ErrNothingToWaitFor) {
+		t.Fatalf("expected ErrNothingToWaitFor with zero processes, got %v", err)
+	}
+	if gotID != "" {
+		t.Fatalf("expected empty ID, got %q", gotID)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Errorf("zero-process wait took %v, want immediate", time.Since(start))
+	}
+
+	// Acceptance 2: only terminal processes.
+	createExecutable(t, cwd, "fast-finish", "exit 0")
+	id, err := proc.Run(cwd, "fast-finish", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+	// Wait until fast-finish has fully terminated
+	if _, err := proc.Wait(cwd, 5, id); err != nil {
+		t.Fatalf("proc.Wait on id failed: %v", err)
+	}
+
+	start = time.Now()
+	gotID, err = proc.Wait(cwd, 600)
+	if !errors.Is(err, proc.ErrNothingToWaitFor) {
+		t.Fatalf("expected ErrNothingToWaitFor with only-terminal processes, got %v", err)
+	}
+	if gotID != "" {
+		t.Fatalf("expected empty ID, got %q", gotID)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Errorf("only-terminal wait took %v, want immediate", time.Since(start))
+	}
+}
+
+// TestWait_AnyMode_ReturnsProcessTransitioningToTerminal pins acceptance 3: an any-mode
+// wait with a live running process waits for it and returns its ID upon completion.
+func TestWait_AnyMode_ReturnsProcessTransitioningToTerminal(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	createExecutable(t, cwd, "sleeper", "sleep 0.15; exit 0")
+	id, err := proc.Run(cwd, "sleeper", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	start := time.Now()
+	gotID, err := proc.Wait(cwd, 5)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("proc.Wait failed: %v", err)
+	}
+	if gotID != id {
+		t.Errorf("expected %q, got %q", id, gotID)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("expected wait to block until process finished, took %v", elapsed)
+	}
+}
+
+// TestWaitAll_AnyMode_ReturnsImmediatelyWhenNoEligible tests WaitAll in any-mode.
+func TestWaitAll_AnyMode_ReturnsImmediatelyWhenNoEligible(t *testing.T) {
+	cwd := setupTestEnv(t)
+
+	start := time.Now()
+	gotID, err := proc.WaitAll(cwd, 600)
+	if !errors.Is(err, proc.ErrNothingToWaitFor) {
+		t.Fatalf("expected ErrNothingToWaitFor with no processes, got %v", err)
+	}
+	if gotID != "" {
+		t.Fatalf("expected empty ID, got %q", gotID)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Errorf("zero-process WaitAll took %v, want immediate", time.Since(start))
 	}
 }
 

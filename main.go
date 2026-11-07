@@ -146,11 +146,13 @@ var listCmd = &cobra.Command{
 }
 
 var waitCmd = &cobra.Command{
-	Use:   "wait [seconds] <proc_id> [proc_id...]",
+	Use:   "wait [seconds] [proc_id...]",
 	Short: "Wait for background processes to reach a terminal state",
-	Long: `Blocks up to the timeout waiting for the listed background processes to finish
-(COMPLETED, FAILED, or CRASHED). At least one process ID is required: the old
-bare any-mode wait is removed.
+	Long: `Blocks up to the timeout waiting for background processes to finish
+(COMPLETED, FAILED, or CRASHED).
+
+If no process IDs are specified, waits for any background process running at call
+time. If there is nothing eligible to wait on, returns immediately and exits 0.
 
 The first argument is the timeout in seconds when it looks like one
 (a non-negative integer); process IDs are 8-character pronounceable slugs and
@@ -163,14 +165,12 @@ at call time is returned immediately.
 With --all, waits until ALL listed processes complete (the batch barrier) and
 prints the last one to finish.
 
-Returns the completed process ID and exits 0.
+Returns the completed process ID and exits 0 (or prints 'nothing to wait for'
+and exits 0 when there was nothing to wait on).
 If the timeout expires before completion, exits non-zero.`,
 	SilenceUsage: true,
 	Args: func(cmd *cobra.Command, args []string) error {
-		if err := cobra.MinimumNArgs(1)(cmd, args); err != nil {
-			return err
-		}
-		if len(args) == 1 && negIntTokenPattern.MatchString(args[0]) {
+		if len(args) >= 1 && negIntTokenPattern.MatchString(args[0]) {
 			return fmt.Errorf("wait: timeout must be a non-negative integer (got %s)", args[0])
 		}
 		return nil
@@ -183,15 +183,12 @@ If the timeout expires before completion, exits non-zero.`,
 
 		timeoutSeconds := proc.MaxWaitSeconds
 		rest := args
-		if isAllDigits(args[0]) {
+		if len(args) > 0 && isAllDigits(args[0]) {
 			timeoutSeconds, err = strconv.Atoi(args[0])
 			if err != nil {
 				return fmt.Errorf("invalid timeout seconds %q: %w", args[0], err)
 			}
 			rest = args[1:]
-		}
-		if len(rest) == 0 {
-			return fmt.Errorf("wait requires at least one process ID")
 		}
 
 		// Wire SIGINT/SIGTERM (agent turn cancel -> tool cancel -> wackyproc wait)
@@ -207,10 +204,20 @@ If the timeout expires before completion, exits non-zero.`,
 			procID, err = proc.WaitContext(waitCtx, cwd, timeoutSeconds, rest...)
 		}
 		if err != nil {
+			if errors.Is(err, proc.ErrNothingToWaitFor) {
+				fmt.Println("nothing to wait for")
+				return nil
+			}
 			return err
 		}
 
 		if procID == "" {
+			if len(rest) == 0 {
+				if allWait {
+					return fmt.Errorf("timeout waiting for all processes")
+				}
+				return fmt.Errorf("timeout waiting for process")
+			}
 			if allWait {
 				return fmt.Errorf("timeout waiting for all of %v", rest)
 			}
