@@ -104,6 +104,205 @@ func TestWaitCmd_CLI_PositionalAsTimeout(t *testing.T) {
 	}
 }
 
+func TestWaitCmd_CLI_NothingEligible_ZeroProcesses(t *testing.T) {
+	resetWaitFlags(t)
+
+	tmpDir := t.TempDir()
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = origStdout }()
+
+	rootCmd.SetArgs([]string{"wait", "600"})
+	start := time.Now()
+	execErr := rootCmd.Execute()
+	elapsed := time.Since(start)
+
+	w.Close()
+
+	var outBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, r)
+
+	if execErr != nil {
+		t.Fatalf("rootCmd.Execute failed: %v", execErr)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Errorf("expected immediate return, took %v", elapsed)
+	}
+	if !strings.Contains(outBuf.String(), "nothing to wait for") {
+		t.Errorf("expected stdout to contain 'nothing to wait for', got %q", outBuf.String())
+	}
+}
+
+func TestWaitCmd_CLI_NothingEligible_OnlyTerminalProcesses(t *testing.T) {
+	resetWaitFlags(t)
+
+	tmpDir := t.TempDir()
+	toolsDir := filepath.Join(tmpDir, proc.ToolsDirName)
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("failed to create tools dir: %v", err)
+	}
+	scriptPath := filepath.Join(toolsDir, "quick-cli")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("failed to write quick-cli: %v", err)
+	}
+
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	id, err := proc.Run(tmpDir, "quick-cli", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+	if _, err := proc.Wait(tmpDir, 5, id); err != nil {
+		t.Fatalf("initial wait failed: %v", err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = origStdout }()
+
+	rootCmd.SetArgs([]string{"wait", "600"})
+	start := time.Now()
+	execErr := rootCmd.Execute()
+	elapsed := time.Since(start)
+
+	w.Close()
+
+	var outBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, r)
+
+	if execErr != nil {
+		t.Fatalf("rootCmd.Execute failed: %v", execErr)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Errorf("expected immediate return, took %v", elapsed)
+	}
+	if !strings.Contains(outBuf.String(), "nothing to wait for") {
+		t.Errorf("expected stdout to contain 'nothing to wait for', got %q", outBuf.String())
+	}
+}
+
+func TestWaitCmd_CLI_NoArgs_NothingEligible(t *testing.T) {
+	resetWaitFlags(t)
+
+	tmpDir := t.TempDir()
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = origStdout }()
+
+	rootCmd.SetArgs([]string{"wait"})
+	start := time.Now()
+	execErr := rootCmd.Execute()
+	elapsed := time.Since(start)
+
+	w.Close()
+
+	var outBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, r)
+
+	if execErr != nil {
+		t.Fatalf("rootCmd.Execute failed: %v", execErr)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Errorf("expected immediate return, took %v", elapsed)
+	}
+	if !strings.Contains(outBuf.String(), "nothing to wait for") {
+		t.Errorf("expected stdout to contain 'nothing to wait for', got %q", outBuf.String())
+	}
+}
+
+func TestWaitCmd_CLI_AnyMode_WithLiveProcess(t *testing.T) {
+	resetWaitFlags(t)
+
+	tmpDir := t.TempDir()
+	toolsDir := filepath.Join(tmpDir, proc.ToolsDirName)
+	if err := os.MkdirAll(toolsDir, 0755); err != nil {
+		t.Fatalf("failed to create tools dir: %v", err)
+	}
+	scriptPath := filepath.Join(toolsDir, "slow-cli")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nsleep 0.15\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("failed to write slow-cli: %v", err)
+	}
+
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir to tmpDir: %v", err)
+	}
+	defer os.Chdir(origCwd)
+
+	id, err := proc.Run(tmpDir, "slow-cli", nil, nil)
+	if err != nil {
+		t.Fatalf("proc.Run failed: %v", err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	origStdout := os.Stdout
+	os.Stdout = w
+	defer func() { os.Stdout = origStdout }()
+
+	rootCmd.SetArgs([]string{"wait", "5"})
+	start := time.Now()
+	execErr := rootCmd.Execute()
+	elapsed := time.Since(start)
+
+	w.Close()
+
+	var outBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, r)
+
+	if execErr != nil {
+		t.Fatalf("rootCmd.Execute failed: %v", execErr)
+	}
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("expected wait to block until slow-cli finished, took %v", elapsed)
+	}
+	if !strings.Contains(outBuf.String(), id) {
+		t.Errorf("expected stdout to contain %q, got %q", id, outBuf.String())
+	}
+}
+
 func TestWaitCmd_CLI_UnknownID_FailsImmediately(t *testing.T) {
 	resetWaitFlags(t)
 

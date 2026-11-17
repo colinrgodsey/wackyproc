@@ -82,15 +82,18 @@ Note: `list --json` is COMPACT by contract - it returns only the table fields pl
 ```
 
 ### 3. Wait for Background Jobs to Finish
-Block up to `N` seconds for listed processes to reach a terminal state:
+Block up to `N` seconds for background processes to reach a terminal state:
 ```bash
-# First completed (default): returns the ID of the first listed process to finish
+# Wait for any running process (first completed); returns immediately if nothing is running:
+wackyproc wait 10
+
+# Wait for specific processes (first completed):
 wackyproc wait 10 a1b2 c3d4
 
 # Barrier: wait for ALL listed processes; returns the last one to finish
 wackyproc wait 10 --all a1b2 c3d4
 ```
-At least one process ID is required - the old bare any-mode wait is removed, and a wait with no IDs fails fast. A process already terminal at entry is returned immediately; a listed ID that does not exist fails immediately. A timeout exits non-zero without returning an ID. Requests longer than 500 seconds are silently capped at 500 - call `wait` again if nothing finished in time rather than requesting a single very long wait.
+If no process IDs are specified, `wait` waits on any process running at call time; if there are no eligible (running) processes at entry, it returns immediately with exit 0 (printing `nothing to wait for`). When process IDs are specified, a process already terminal at entry is returned immediately, and a listed ID that does not exist fails immediately. A timeout exits non-zero without returning an ID. Requests longer than 500 seconds are silently capped at 500 - call `wait` again if nothing finished in time rather than requesting a single very long wait.
 
 ### 4. Retrieve Output (Stdout & Stderr)
 Read the full captured stdout and stderr streams:
